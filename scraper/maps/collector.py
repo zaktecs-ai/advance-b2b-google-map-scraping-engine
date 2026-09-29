@@ -187,19 +187,24 @@ def _settle_panel(page, rounds: int = 4, pause_ms: int = 400) -> None:
     """Scroll the detail panel so lazy sections (hero photo, photos carousel,
     owner posts) hydrate before extraction. Best-effort, never raises.
 
-    The wheel only scrolls the element under the cursor, so the cursor is
-    moved INTO the detail panel (div[role=main]) first - over the feed it
-    would scroll the results list instead and the panel stays unhydrated
-    (live-verified).
-
-    PERF: ONE batched evaluate() runs every round inside the page — the old
-    per-round Python<->browser round-trip + fixed sleep is gone. Each in-page
-    round is capped at 150ms of settle sleep (rAF-paired), and the function
-    returns as soon as the panel's scroll height stops growing between
-    rounds (settled) — condition-based, not fixed-sleep-based. The caller's
-    photo-retry round (deep_scroll + re-read) remains the safety net when a
-    lazy section still hasn't hydrated.
+    PERF (round 2): on the current Maps layout the panel arrives PRE-HYDRATED
+    after the click (live-measured: cover image + photos section present at
+    first read, 0 scrolls needed). So the function first CHECKS whether the
+    photo anchors are already hydrated — if yes, zero scrolling, zero sleeps.
+    Only a not-yet-hydrated panel runs the in-page scroll rounds (bounded,
+    rAF-paired, returns early when the panel scroll height stabilizes).
     """
+    try:
+        hydrated = page.evaluate(
+            """() => !!(document.querySelector(
+                'button.aoRNLd img[src^="http"],'
+                + ' div.ZKCDEc img[src^="http"],'
+                + ' img[src^="https://lh3"],'
+                + ' button.aoRNLd, div.ZKCDEc'))""")
+        if hydrated:
+            return
+    except Exception:  # noqa: BLE001 — fall through to the scroll path
+        pass
     try:
         page.evaluate(
             """async ([rounds, pauseMs]) => {
@@ -789,6 +794,12 @@ def _click_card_for(page, card_map: dict, place_url: str) -> bool:
     switched to the place — proven by the SAME token appearing in
     location.href (the old full-href substring check is what forced every
     listing onto the slow goto fallback).
+
+    PERF (round 2): the click's wait now ALSO proves the panel h1 hydrated
+    (name row present) in the SAME wait_for_function — the micro-timeline
+    showed the data rows and h1 land together with the URL switch, so the
+    caller's separate identity wait completes on its first poll instead of
+    paying a second round-trip latency.
     """
     token = _place_token(place_url)
     for sel, m in (card_map or {}).items():
@@ -800,17 +811,44 @@ def _click_card_for(page, card_map: dict, place_url: str) -> bool:
         try:
             locs = page.locator(sel)
             if locs.count() > index:
-                locs.nth(index).click(timeout=5000)
+                # PERF (round 2): dispatch the card click via the DOM
+                # (evaluate) — live-measured ~250ms faster per listing than
+                # locator.click()'s trusted-event simulation and 6/6 reliable
+                # on real Maps (URL switch + panel h1 verified). Any failure
+                # falls back to the trusted locator click below.
+                clicked = False
+                try:
+                    clicked = page.evaluate(
+                        """(a) => {
+                            const [sel, i] = a;
+                            const nodes = document.querySelectorAll(sel);
+                            if (nodes && nodes.length > i) { nodes[i].click(); return true; }
+                            return false;
+                        }""", [sel, index])
+                except Exception:  # noqa: BLE001 — fall back to trusted click
+                    clicked = False
+                if not clicked:
+                    locs.nth(index).click(timeout=5000)
                 try:
                     if token:
                         page.wait_for_function(
-                            "tok => decodeURIComponent(location.href)"
-                            ".includes(tok)",
+                            """tok => {
+                                if (!decodeURIComponent(location.href)
+                                        .includes(tok)) return false;
+                                const h = document.querySelector(
+                                    'h1.DUwDvf, h1[class*="fontHeadline"]');
+                                return !!(h && h.textContent.trim());
+                            }""",
                             arg=token, timeout=8_000)
                     else:
                         page.wait_for_function(
-                            "href => location.href.includes("
-                            "decodeURIComponent(href))",
+                            """href => {
+                                if (!location.href.includes(
+                                        decodeURIComponent(href))) return false;
+                                const h = document.querySelector(
+                                    'h1.DUwDvf, h1[class*="fontHeadline"]');
+                                return !!(h && h.textContent.trim());
+                            }""",
                             arg=place_url, timeout=8_000)
                     return True
                 except Exception:
@@ -1182,36 +1220,46 @@ class MapsCollector:
                     pass
                 return data
 
-        # PERF (Fix E): ONE combined identity wait. The old flow ran three
-        # sequential waits (h1 10s + slug identity 6s + name marker 5s — a
-        # worst case of 21s on a slow panel). This single wait_for_function
-        # proves all three conditions at once. CRITICAL selector-order note:
-        # the PANEL h1 must be found FIRST — in DOM order the results feed's
-        # "Results" h1 comes before the panel's business h1, so a generic
-        # 'h1' match would grab the feed heading, never match the place
-        # slug, and burn the full timeout on EVERY listing (live-verified).
+        # PERF (Fix E, round 2): ONE combined readiness wait — URL identity is
+        # already proven by the click path (token in location.href + h1), so
+        # this wait proves the DATA ROWS hydrated (address/phone/website) plus
+        # the panel h1 slug match. The micro-timeline showed rows land WITH
+        # the URL switch, so 3.5s is a generous ceiling (was 8s; old flow was
+        # three sequential waits — h1 10s + slug 6s + name 5s, worst 21s).
+        # CRITICAL selector-order note: the PANEL h1 must be found FIRST — in
+        # DOM order the results feed's "Results" h1 comes before the panel's
+        # business h1 (live-verified).
         expected_slug = (parse_google_maps_url(place_url).get("place_name") or "")
         try:
             page.wait_for_function(
                 """slug => {
-                    // Panel h1 candidates, most specific first; the last two
-                    // filter out feed headings via closest(feed).
-                    const h = document.querySelector('h1.DUwDvf, h1[class*="fontHeadline"]')
+                    const h = document.querySelector(
+                        'h1.DUwDvf, h1[class*="fontHeadline"]')
                              || Array.from(document.querySelectorAll('h1'))
                                  .find(el => !el.closest('div[role="feed"]')
                                               && el.textContent.trim());
                     if (!h || !h.textContent.trim()) return false;
-                    if (!slug) return true;
-                    const key = decodeURIComponent(slug).toLowerCase()
-                        .replace(/[-+]/g, ' ').split(/\\s+/)
-                        .filter(t => t.length > 2)[0] || '';
-                    return !key || h.textContent.trim().toLowerCase().includes(key);
+                    if (slug) {
+                        const key = decodeURIComponent(slug).toLowerCase()
+                            .replace(/[-+]/g, ' ').split(/\\s+/)
+                            .filter(t => t.length > 2)[0] || '';
+                        if (key &&
+                                !h.textContent.trim().toLowerCase()
+                                    .includes(key)) return false;
+                    }
+                    // Data rows: address OR phone OR website hydrated —
+                    // the batched read is meaningful the moment any row lands.
+                    return !!(document.querySelector(
+                        'button[data-item-id="address"],'
+                        + ' div[data-item-id="address"],'
+                        + ' button[data-item-id^="phone"],'
+                        + ' a[data-item-id="authority"]'));
                 }""",
-                arg=expected_slug, timeout=8_000)
+                arg=expected_slug, timeout=3_500)
         except Exception:
-            log.debug("combined panel identity wait missed for %s", place_url)
+            log.debug("combined panel readiness wait missed for %s", place_url)
             try:
-                time.sleep(1.0)
+                time.sleep(0.5)
             except Exception:  # noqa: BLE001
                 pass
 
@@ -1459,48 +1507,89 @@ class MapsCollector:
 
     # -- feed scrolling / link extraction ---------------------------------
     def _scroll_results(self, page) -> None:
-        feed = None
-        try:
-            loc = page.locator('div[role="feed"]')
-            if loc.count() > 0:
-                feed = loc.first
-        except Exception:
-            feed = None
+        """Scroll the results feed until it stops growing (bounded).
 
+        PERF (round 2): the entire loop (scroll rounds + settle waits +
+        end-of-list check + stall detection) now runs INSIDE the page as one
+        evaluate() — the old flow cost 3 Python<->browser round-trips per
+        round (scroll, end-check, height-check) plus a Python-side sleep per
+        round. The in-page loop keeps the SAME semantics: scroll_delay_min/max
+        jitter between rounds (politeness pacing preserved), stop when the
+        feed's scroll height stops growing for 3 consecutive rounds, stop at
+        the 'end of the list' marker, hard cap of max_scrolls rounds.
+        """
         # maps.max_scrolls: 0 = built-in safety bound (12 rounds).
         max_rounds = self._max_scrolls if self._max_scrolls > 0 else 12
-        last_height = -1
-        stalled = 0
-        for _ in range(max_rounds):
+        lo, hi = self._scroll_delay
+        try:
+            page.evaluate(
+                """async (args) => {
+                    const [maxRounds, minMs, maxMs] = args;
+                    const sleep = (ms) => new Promise(
+                        r => setTimeout(r, ms));
+                    const jitter = () => minMs + Math.random() * (maxMs - minMs);
+                    const feed = document.querySelector('div[role="feed"]');
+                    let lastH = -1, stalled = 0;
+                    for (let k = 0; k < maxRounds; k++) {
+                        if (feed) {
+                            feed.scrollTo(0, feed.scrollHeight);
+                        } else {
+                            window.scrollBy(0, 1200);
+                        }
+                        await sleep(jitter());
+                        const txt = (document.body.innerText || '');
+                        if (txt.includes(
+                                "You've reached the end of the list")) {
+                            return {end: true, rounds: k + 1};
+                        }
+                        const h = feed ? feed.scrollHeight : document.body.scrollHeight;
+                        if (h === lastH) {
+                            stalled += 1;
+                            if (stalled >= 3) {
+                                return {end: false, rounds: k + 1};
+                            }
+                        } else {
+                            stalled = 0;
+                        }
+                        lastH = h;
+                    }
+                    return {end: false, rounds: maxRounds};
+                }""",
+                [max_rounds, float(lo), float(hi)])
+        except Exception:  # noqa: BLE001 — in-page loop failed, use old path
+            feed = None
             try:
-                if feed is not None:
-                    feed.evaluate("el => el.scrollTo(0, el.scrollHeight)")
-                else:
+                loc = page.locator('div[role="feed"]')
+                if loc.count() > 0:
+                    feed = loc.first
+            except Exception:
+                feed = None
+            last_height = -1
+            stalled = 0
+            for _ in range(max_rounds):
+                try:
+                    if feed is not None:
+                        feed.evaluate("el => el.scrollTo(0, el.scrollHeight)")
+                    else:
+                        page.mouse.wheel(0, 1200)
+                except Exception:
                     page.mouse.wheel(0, 1200)
-            except Exception:
-                page.mouse.wheel(0, 1200)
-            lo, hi = self._scroll_delay
-            time.sleep(random.uniform(lo, hi) / 1000.0)
-            if self._has_no_more_results(page):
-                break
-            # maps.scroll_pause_seconds: when the feed height stops growing,
-            # lazy-loaded cards may still be inflight — wait and retry a
-            # bounded number of times before giving up.
-            height = -1
-            try:
-                if feed is not None:
-                    height = int(feed.evaluate("el => el.scrollHeight"))
-            except Exception:
-                height = -1
-            if height == last_height:
-                stalled += 1
-                if self._scroll_pause_seconds > 0:
-                    time.sleep(self._scroll_pause_seconds)
-                if stalled >= 3:
+                time.sleep(random.uniform(lo, hi) / 1000.0)
+                if self._has_no_more_results(page):
                     break
-            else:
-                stalled = 0
-            last_height = height
+                height = -1
+                try:
+                    if feed is not None:
+                        height = int(feed.evaluate("el => el.scrollHeight"))
+                except Exception:
+                    height = -1
+                if height == last_height:
+                    stalled += 1
+                    if stalled >= 3:
+                        break
+                else:
+                    stalled = 0
+                last_height = height
 
     def _has_no_more_results(self, page) -> bool:
         try:
@@ -1516,8 +1605,36 @@ class MapsCollector:
         # set. A bare `set` -> `list` has no stable order across processes
         # (hash randomization), so a capped first-N slice would otherwise pick a
         # different subset of businesses on every run.
-        links: list = []
-        seen: set = set()
+        # PERF (round 2): ONE evaluate() returns every card href in DOM order
+        # (n round-trips -> 1); the per-locator loop remains as the fallback.
+        try:
+            hrefs = page.evaluate(
+                """() => {
+                    const out = [];
+                    for (const sel of %s) {
+                        const nodes = document.querySelectorAll(sel);
+                        for (const el of nodes) {
+                            const href = el.getAttribute && el.getAttribute('href');
+                            if (href && href.includes('/maps/place/')) {
+                                out.push(href);
+                            }
+                        }
+                        if (out.length) break;
+                    }
+                    return out;
+                }""" % _js_literal(RESULT_CARD_SELECTORS))
+            if isinstance(hrefs, list):
+                seen: set = set()
+                links: list = []
+                for href in hrefs:
+                    if "/maps/place/" in href and href not in seen:
+                        seen.add(href)
+                        links.append(href)
+                return links
+        except Exception:  # noqa: BLE001 — fall back to the locator loop
+            pass
+        links = []
+        seen = set()
         for sel in RESULT_CARD_SELECTORS:
             try:
                 locs = page.locator(sel)

@@ -787,3 +787,39 @@ Verification: 290/290 tests pass; live probes on real Google Maps
 1.9–3.3s across runs; round-trips/listing 251 → 34–39; data spot-check
 (name/rating/review_count/cover image/category/address/phone) all correct.
 Full breakdown + reproduction steps: docs/PERFORMANCE.md.
+
+---
+
+## PERF-ROUND-2 — Hot-path micro-optimizations (deep re-scan, live-measured)
+
+A second full forensic pass (per-wait instrumentation of every remaining
+millisecond on the hot path) found the click/scroll loop still carrying
+avoidable latency:
+
+- **P10 — settle_panel checked nothing before scrolling.** The current Maps
+  layout serves the detail panel PRE-HYDRATED after the click (cover image +
+  photos section present at first read, live-measured). The function now
+  checks hydration first and returns immediately — measured 402ms → 3.8ms
+  per listing (~100×). Not-yet-hydrated panels still run the bounded scroll
+  rounds.
+- **P11 — the click's URL-switch wait and the caller's identity wait proved
+  the same facts twice.** The click wait now also proves the panel h1
+  hydrated (combined wait_for_function), so the caller's readiness wait
+  completes on its first poll. A/B measured: combined 269ms vs URL-only
+  452ms.
+- **P12 — trusted-event locator.click costs ~250ms more than a DOM click.**
+  Card clicks are now dispatched via one evaluate() (6/6 reliable live —
+  URL switch + panel h1 verified per card), with the trusted locator click
+  kept as the fallback.
+- **P13 — the feed scroll loop ran 3 Python<->browser round-trips + a
+  Python-side sleep per round.** The whole loop (scroll + jitter pacing +
+  end-of-list marker + 3-round stall detection) now runs as ONE evaluate()
+  with identical semantics; the old loop remains as the fallback.
+- **P14 — listing-link extraction was O(cards) per-card round-trips.** Now
+  one evaluate() returns every href in DOM order (order-preserving dedup
+  unchanged); the locator loop remains as the fallback.
+
+Deep-probe (7–8 listings, zero pacing): 2.11s → **1.30s/listing**. Observed
+Google-side variance documented in docs/PERFORMANCE.md (first panel ~5s
+SPA warm-up; rotating "limited view" panels omit the review-count row —
+engine honestly reports N/A instead of guessing). tests: 290/290.

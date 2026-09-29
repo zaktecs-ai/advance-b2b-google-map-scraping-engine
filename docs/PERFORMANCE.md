@@ -62,6 +62,40 @@
 
 ## 4. Final results (MEASURED, post-optimization)
 
+### Round 2 micro-optimizations (2026-09-29 late, live-measured)
+
+The deep re-scan (per-wait instrumentation of every remaining millisecond)
+found three more wins on the hot path:
+
+- **`_settle_panel` now checks hydration first** — the current Maps layout
+  serves the panel PRE-HYDRATED after the click (cover image + photos
+  section present at first read). Measured: 402ms → **3.8ms** (~100×).
+  Only a not-yet-hydrated panel runs the scroll rounds.
+- **The click's URL-switch wait also proves the panel h1** (combined) — the
+  caller's readiness wait then completes on its first poll. A/B measured:
+  URL+h1 wait 269ms vs URL-only 452ms (both dominated by Google's SPA
+  switch; combined is never slower).
+- **Card click dispatched via DOM evaluate()** (~250ms faster than the
+  trusted-event locator click; 6/6 reliable live — URL switch + h1 verified
+  per card; trusted locator click remains the fallback).
+- **Feed scroll loop moved in-page** (one evaluate: scroll + jitter sleep +
+  end-marker + stall detection; was 3 round-trips + Python sleep per round).
+- **Listing-link extraction batched** (n per-card round-trips → 1).
+
+Deep-probe after round 2 (7–8 listings, zero pacing):
+**1.30s/listing** (round 1: 2.11s; original: ~10.4–15.3s). With production
+pacing (avg 0.8s) the single-stream projection is **~2.1s/listing**, and
+`maps.workers: 2` measured earlier at 2.9s/listing (that run pre-dated round
+2 — re-measure on the next production run).
+
+**Google-side latency variance (observed, not a bug):** first panel after a
+fresh page load takes ~4–5s (SPA warm-up); subsequent panels 250–350ms.
+Probe sessions occasionally drew 4–8s panels for several cards in a row —
+Google serves variable panel-render latency (and a rotating "limited view"
+variant that omits the review-count row entirely; rating still present).
+The engine correctly reports `N/A` for review_count on those panels rather
+than guessing.
+
 ### Full production-style run (2026-09-29, MEASURED)
 
 3 queries on real Google Maps (dentists Dallas / roofers San Antonio /

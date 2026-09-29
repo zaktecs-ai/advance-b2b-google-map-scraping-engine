@@ -63,7 +63,18 @@ class _FakePage:
         # Shape: {selector: {token-or-href: index}} — tokens are the
         # !1s0x…:0x… place-id fragments INCLUDING the !1s prefix, exactly
         # what _place_token() builds on the Python side.
+        # The DOM-click dispatch (round 2) is emulated too: clicking via
+        # evaluate marks the card clicked exactly like the real page.
         import re as _re
+        # DOM-click dispatch (round 2): args = [selector, index]
+        if (args and isinstance(args[0], list) and len(args[0]) == 2
+                and isinstance(args[0][0], str)
+                and isinstance(args[0][1], int)):
+            sel, i = args[0]
+            if 0 <= i < len(self._cards):
+                self._cards[i]["clicked"] = True
+                return True
+            return False
         out = {}
         for sel in C.RESULT_CARD_SELECTORS:
             m = {}
@@ -314,8 +325,11 @@ def test_apply_batched_fields_claim_chip_means_unclaimed():
 
 def test_open_and_extract_has_no_three_sequential_waits():
     src = open(C.__file__, encoding="utf-8").read()
-    # The three old sequential waits must be gone; ONE combined wait remains.
-    assert "combined panel identity wait" in src
+    # The three old sequential waits must be gone; ONE combined readiness
+    # wait remains (round 2 renamed identity -> readiness: URL identity is
+    # proven in the click path; this wait proves h1 + data rows).
+    assert "combined panel readiness wait" in src
+    assert "combined panel identity wait" not in src
     assert src.count("wait_for_selector('h1', timeout=10_000") == 0
     assert "timeout=5_000)\n        except Exception:\n            time.sleep(1.0)" \
         not in src
