@@ -10,6 +10,7 @@ import logging
 from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
+from bs4 import FeatureNotFound
 
 log = logging.getLogger(__name__)
 
@@ -63,7 +64,13 @@ def crawl_priority(html: str, base_url: str, max_pages: int = 10) -> list:
 def crawl_sitemap_aware(sitemap_xml: str, base_url: str, keyword: str = "",
                         max_pages: int = 15) -> list:
     """Extract relevant URLs from a sitemap.xml, filtered by keyword/hints."""
-    soup = BeautifulSoup(sitemap_xml, "lxml")
+    # Sitemaps are XML: parse with the XML parser when available (silences
+    # XMLParsedAsHTMLWarning and is more reliable for namespaced sitemaps);
+    # fall back to the HTML parser only when the XML mode is unavailable.
+    try:
+        soup = BeautifulSoup(sitemap_xml, "lxml-xml")
+    except FeatureNotFound:  # pragma: no cover — lxml ships in requirements
+        soup = BeautifulSoup(sitemap_xml, "lxml")
     urls = [loc.get_text().strip() for loc in soup.find_all("loc")]
     urls = [u for u in urls if u.startswith(("http://", "https://"))]
     if keyword:

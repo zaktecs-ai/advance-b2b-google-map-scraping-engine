@@ -927,7 +927,9 @@ class MapsCollector:
         errors: list[Exception] = []
         err_lock = threading.Lock()
 
-        def _worker(wid: int, place_urls: list[str], total: int):
+        def _worker(wid: int, jobs: list[tuple[int, str]], total: int):
+            # jobs: list of (original_position, place_url) so the progress
+            # counter shows the card's true position in the results list.
             # Playwright's sync API is greenlet-bound: a browser created on
             # one thread cannot be driven from another. Each worker therefore
             # owns a PRIVATE Playwright + Chromium (bm.thread_browser), the
@@ -943,10 +945,15 @@ class MapsCollector:
                 ctx = tb.new_context()
                 page = ctx.new_page()
                 page.set_default_timeout(tb.nav_timeout_ms)
-                for pos, place_url in enumerate(place_urls, start=1):
+                for pos, place_url in jobs:
+                    # Shared cap: stop when the run-wide total is reached
+                    # (mirrors the serial path's max_total break).
+                    if (self._max_total and
+                            self._yielded_total >= self._max_total):
+                        self.limit_reached = True
+                        break
                     data = self._open_and_extract(
-                        page, place_url,
-                        position=wid * 100000 + pos, total=total)
+                        page, place_url, position=pos, total=total)
                     if not data.get("business_name"):
                         data["business_name"] = fallback_business_name(place_url)
                     data["source_query"] = query
@@ -983,9 +990,10 @@ class MapsCollector:
             except Exception:
                 pass
 
-        slices: list[list[str]] = [[] for _ in range(workers)]
-        for i, url in enumerate(listing_links):
-            slices[i % workers].append(url)
+        slices: list[list[tuple[int, str]]] = [
+            [] for _ in range(workers)]
+        for i, url in enumerate(listing_links, start=1):
+            slices[(i - 1) % workers].append((i, url))
 
         threads = []
         for wid in range(workers):
@@ -1007,15 +1015,17 @@ class MapsCollector:
                 continue
             produced += 1
             self._yielded_total += 1
-            if self._max_total and self._yielded_total > self._max_total:
-                # Cap reached: stop accepting; workers keep running but the
-                # caller sees exactly the cap. (Workers check nothing here;
-                # the cap is enforced by this consumer, as in the serial path
-                # where the check sits in the produce loop.)
-                pass
+            if (self._max_total and self._yielded_total >= self._max_total):
+                # Cap reached: workers see the shared counter and stop;
+                # drain what is already produced, then finish the query.
+                self.limit_reached = True
+                yield item
+                for t in threads:
+                    t.join(timeout=10.0)
+                return
             yield item
         for t in threads:
-            t.join(timeout=5.0)
+            t.join(timeout=10.0)
         if errors and produced == 0:
             raise errors[0]
 

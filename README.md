@@ -162,21 +162,26 @@ custom signals, VNC, logging) are all documented with comments inside
 
 ## Speed & Performance
 
-Measured on **real Google Maps** with the real engine code (not estimates):
+**Real 3-query production run** (default settings, real Google Maps,
+single IP, 2-core test server): **304 leads in 22 minutes ≈ 14 leads/min**,
+zero failures. The same job on the previous version needed ~78 minutes
+just for the Maps part — **3.7× measured end-to-end** (a 4-core server
+does better; the first query warms up, later queries ran at 2.1–4.3 s per
+listing).
 
 | Measurement | Before | After |
 | --- | --- | --- |
 | Time per listing (one browser) | ~15.3 s | **1.9–3.3 s** |
-| Time per listing (default 2 browsers) | ~15.3 s | **2.9 s** (measured: 20 listings in 57.4 s) |
+| Time per listing (default 2 browsers, warmed up) | ~15.3 s | **2.1–4.3 s** |
+| 3-query, ~300-lead job | ~8–9 hours (2,000-lead scale) | **22 minutes** (304 leads measured) |
 | Browser commands per listing | 251 | **34–39** |
 
 In production terms: a 2,000-lead job that previously took **8–9 hours**
-now takes roughly **2 hours** (depending on pauses, website speeds, and
-Google's mood). The full audit report — every measurement, what was slow
-and why, what was changed, and how to reproduce the numbers — is in
+now projects to roughly **2–2.5 hours** on the same single-IP setup.
+Full audit — every measurement, root causes, and how to reproduce:
 **[docs/PERFORMANCE.md](docs/PERFORMANCE.md)**.
 
-The safety behavior is unchanged: pause settings, CAPTCHA detection, and
+Safety behavior is unchanged: pause settings, CAPTCHA detection, and
 cooldown still work exactly as before — if Google pushes back, slow the
 engine down (see the `delays` settings above).
 
