@@ -197,3 +197,101 @@ class BrowserManager:
     @property
     def browser(self):
         return self._ensure_browser()
+
+    # ------------------------------------------------------------------
+    # Per-thread browsers (parallel Maps workers)
+    # ------------------------------------------------------------------
+    def thread_browser(self):
+        """A PRIVATE Playwright connection + Chromium for the CALLING thread.
+
+        Playwright's sync API is greenlet-bound: a browser created on one
+        thread cannot be driven from another (``greenlet.error: Cannot
+        switch to a different thread``). The parallel Maps workers therefore
+        each need their own connection — the same one-connection-per-thread
+        pattern ``websites/browser_pool.py`` uses. Use as a context manager::
+
+            with bm.thread_browser() as tb:
+                ctx = tb.new_context()
+                page = ctx.new_page()
+
+        Launch settings (headless, proxy, anti-automation flag, VNC display
+        env) mirror ``_ensure_browser`` so behavior matches the main browser.
+        """
+        return _ThreadBrowser(self)
+
+
+class _ThreadBrowser:
+    """One private Playwright + Chromium owned by a single worker thread.
+
+    All launch/context settings are delegated to the parent BrowserManager so
+    there is exactly ONE source of truth for proxy rotation, user agent, and
+    viewport (no drift between the main and worker browsers).
+    """
+
+    def __init__(self, bm: "BrowserManager"):
+        self._bm = bm
+        self._pw = None
+        self._browser = None
+
+    def __enter__(self):
+        from playwright.sync_api import sync_playwright
+        bm = self._bm
+        # Mirror _ensure_browser's display routing for visible browsers.
+        if not bm._headless and bm._display:
+            os.environ["DISPLAY"] = bm._display
+            xauth = os.path.join(os.path.expanduser("~"), ".Xauthority")
+            if os.path.exists(xauth):
+                os.environ["XAUTHORITY"] = xauth
+        self._pw = sync_playwright().start()
+        launch_kwargs = {"headless": bm._headless}
+        if bm._proxy:
+            launch_kwargs["proxy"] = bm._proxy
+        self._browser = self._pw.chromium.launch(
+            args=["--disable-blink-features=AutomationControlled"],
+            **launch_kwargs)
+        log.info("thread browser launched (headless=%s)", bm._headless)
+        return self
+
+    def new_context(self, proxy: dict | None = None,
+                    geolocation: dict | None = None,
+                    locale: str | None = None):
+        """Same per-context resolution as BrowserManager.new_context."""
+        bm = self._bm
+        ctx_proxy = proxy
+        if ctx_proxy is None and bm._proxy_manager is not None:
+            ctx_proxy = bm._proxy_manager.playwright_proxy()
+        if ctx_proxy is None:
+            ctx_proxy = bm._proxy
+        kwargs = {
+            "viewport": {"width": 1366, "height": 900},
+            "locale": locale or bm._locale,
+            "user_agent": bm._user_agent,
+        }
+        if ctx_proxy:
+            kwargs["proxy"] = ctx_proxy
+        if geolocation:
+            kwargs["geolocation"] = geolocation
+            kwargs["permissions"] = ["geolocation"]
+        return self._browser.new_context(**kwargs)
+
+    @property
+    def nav_timeout_ms(self) -> int:
+        return self._bm.nav_timeout_ms
+
+    def close(self) -> None:
+        if self._browser is not None:
+            try:
+                self._browser.close()
+            except Exception as e:  # pragma: no cover
+                log.debug("thread browser close error: %s", e)
+            self._browser = None
+        if self._pw is not None:
+            try:
+                self._pw.stop()
+            except Exception as e:  # pragma: no cover
+                log.debug("thread playwright stop error: %s", e)
+            self._pw = None
+
+    def __exit__(self, *exc):
+        self.close()
+        return False

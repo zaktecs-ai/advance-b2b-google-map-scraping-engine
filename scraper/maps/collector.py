@@ -928,12 +928,21 @@ class MapsCollector:
         err_lock = threading.Lock()
 
         def _worker(wid: int, place_urls: list[str], total: int):
+            # Playwright's sync API is greenlet-bound: a browser created on
+            # one thread cannot be driven from another. Each worker therefore
+            # owns a PRIVATE Playwright + Chromium (bm.thread_browser), the
+            # same one-connection-per-thread pattern websites/browser_pool.py
+            # uses. Context settings (proxy rotation, UA, viewport) still come
+            # from the shared BrowserManager — one source of truth.
+            tb = None
             ctx = None
             page = None
             try:
-                ctx = self._bm.new_context()
+                tb = self._bm.thread_browser()
+                tb.__enter__()
+                ctx = tb.new_context()
                 page = ctx.new_page()
-                page.set_default_timeout(self._bm.nav_timeout_ms)
+                page.set_default_timeout(tb.nav_timeout_ms)
                 for pos, place_url in enumerate(place_urls, start=1):
                     data = self._open_and_extract(
                         page, place_url,
@@ -950,17 +959,14 @@ class MapsCollector:
             except Exception as e:  # noqa: BLE001 — record, never crash the fanout
                 with err_lock:
                     errors.append(e)
+                log.debug("maps worker %d failed: %s", wid, e)
             finally:
-                if page is not None:
-                    try:
-                        page.close()
-                    except Exception:
-                        pass
-                if ctx is not None:
-                    try:
-                        ctx.close()
-                    except Exception:
-                        pass
+                for closer in (page, ctx, tb):
+                    if closer is not None:
+                        try:
+                            closer.close()
+                        except Exception:
+                            pass
 
         # Discovery stays SERIAL (one worker scrolls the feed + builds the
         # card list); only per-listing extraction is fanned out. This
