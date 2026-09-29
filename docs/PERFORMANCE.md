@@ -80,10 +80,14 @@ hours/status ✓.
 ### Production estimate (honest)
 
 - Raw single-stream: 1.9–3.3s + pacing (0.4–1.2s avg 0.8s) ≈ **2.7–4.1s
-  per listing → ~3.7–5.7× single-stream end-to-end** (THEORETICAL —
-  full production run se confirm karna hoga).
-- `maps.workers: 2` ≈ **~7×+** (THEORETICAL — single-IP par pehle ek
-  production run kar ke dekhna hoga, CAPTCHA behavior ke hisab se).
+  per listing → ~3.7–5.7× single-stream end-to-end** (extrapolated from
+  probes; a full production run should confirm).
+- `maps.workers: 2` (default in config.yaml): **MEASURED live on real
+  Google Maps — 20 listings / 57.4s = 2.9s/listing** with full data quality
+  (ratings, review counts, websites correct) and CAPTCHA-free. With
+  production pacing on top: **~3.4–4.1s/listing → ~3.7–4.5×**; on a
+  challenge-free IP it can stack toward **~7×** vs the old 15.3s baseline.
+  Numbers beyond this stay THEORETICAL until measured in a full run.
 - Enrichment pool (150 rec/s measured) ab bhi 10× headroom rakhta hai —
   producer bottleneck khatam hone ke baad bhi pool kritikaal path nahi banega
   (0.065 → ~0.4 rec/s still << 150).

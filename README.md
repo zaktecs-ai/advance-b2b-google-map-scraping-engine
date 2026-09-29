@@ -4,9 +4,11 @@ Advance B2B GMS Google Maps se business leads nikalta hai: listing data,
 reviews, website emails, social links, technology stack — sab CSV/XLSX mein.
 Yeh ek command-line program hai jo Linux server (VPS) par chalta hai.
 
-> **5–8× tez:** Is version mein Google Maps ka discovery path redesign kiya
-> gaya hai (live-measured: ~15 second/listing → ~2–3.5 second/listing, bina
-> koi field ya quality kam kiye). Tafseel neeche **"Speed"** section mein.
+> **4–5× tez (live-measured):** Google Maps ka discovery path redesign
+> kiya gaya hai — single-stream: ~15.3s → 1.9–3.3s/listing; default
+> `maps.workers: 2`: **2.9s/listing (20 listings / 57.4s, real Google Maps
+> par napa gaya)**, bina koi field ya quality kam kiye. Tafseel neeche
+> **"Speed"** section aur docs/PERFORMANCE.md mein.
 
 > **Python 3.11+ zaroori.** Decision-maker regex Python 3.11 ke naye
 > features use karta hai.
@@ -64,7 +66,8 @@ Sab numbers **real Google Maps** par asli code chala kar napa gaye hain
 
 | Cheez | Pehle | Ab | Notes |
 |---|---|---|---|
-| Per-listing raw cost | ~15.3s | **1.9–3.3s** | 5–8× faster single stream |
+| Per-listing raw cost (1 worker) | ~15.3s | **1.9–3.3s** | live-measured, zero pacing |
+| Per-listing cost (workers=2, default) | ~15.3s | **2.9s** | live-measured: 20 listings / 57.4s |
 | Browser round-trips / listing | 251 | **34–39** | batched evaluate() calls |
 | Reviews (jab na hon) | ~7.2s jala | **0.02s** | limited-view ko detect kar ke skip |
 | Card matching | O(n²) per query | **O(n)** | token-based index map |
