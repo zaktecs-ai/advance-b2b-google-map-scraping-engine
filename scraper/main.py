@@ -43,6 +43,7 @@ def _build_collector(config, demo: bool, browser_manager, progress=None):
         on_query_total=(progress.set_query_total if progress is not None else None),
         max_scrolls=m.max_scrolls,
         scroll_pause_seconds=m.scroll_pause_seconds,
+        extract_owner_posts=m.extract_owner_posts,
     )
 
 

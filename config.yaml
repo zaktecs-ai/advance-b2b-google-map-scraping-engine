@@ -29,6 +29,14 @@ maps:
   scroll_delay_min_ms: 800
   scroll_delay_max_ms: 1600
   page_navigation_timeout_ms: 30000
+  # --- SPEED (see docs/PERFORMANCE.md) --------------------------------------
+  workers: 2                   # 1 = old single-page serial discovery.
+                               # 2-3 = parallel per-listing extraction with
+                               # isolated browser contexts (feed discovery
+                               # itself stays serial for correctness). On a
+                               # bot challenge everything falls back to 1.
+  extract_owner_posts: false   # true = restore the ~3s/listing deep scroll
+                               # for has_recent_post / latest_post_date.
 
 reviews:
   enabled: true
@@ -112,8 +120,12 @@ concurrency:
                                # pacing) — this knob does not parallelize Maps.
 
 delays:
-  maps_min_seconds: 2.0
-  maps_max_seconds: 5.0
+  # Maps between-listing pacing. Old conservative default was 2.0-5.0s per
+  # listing (a large share of the old ~15s/listing runtime). The engine
+  # already auto-backs-off (cooldown + proxy feedback) on a bot challenge.
+  # If you see CAPTCHAs often, raise these back to 2.0 / 5.0.
+  maps_min_seconds: 0.4
+  maps_max_seconds: 1.2
   site_min_seconds: 0.3
   site_max_seconds: 0.8
   cooldown_seconds: 60

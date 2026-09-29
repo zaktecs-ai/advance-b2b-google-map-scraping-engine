@@ -120,13 +120,72 @@ _REVIEW_TAB_SELECTORS = [
     'button:has-text("Reviews")',
     'div[role="tab"]:has-text("Reviews")',
 ]
-# Body text ONLY. The whole-card fallback ('div[class*="jftiEf"]') previously
-# harvested reviewer name + UI chrome ("4 reviews · 1 photo… Like Share
-# Response from the owner"), which poisoned top_review / review_keywords (F08).
 _REVIEW_TEXT_SELECTORS = [
     'div[class*="jftiEf"] span[class*="wiI7pd"]',
     'span[class*="wiI7pd"]',
 ]
+
+# Google "limited view" (rolled out Feb 2026, still triggers on logged-out
+# sessions / flagged traffic): the place panel is served WITHOUT the reviews
+# section entirely — no tab, no dialog, no error. Detecting it up front lets
+# the extractor fast-fail in milliseconds instead of burning every selector
+# timeout + scroll pass against a section that does not exist.
+_LIMITED_VIEW_MARKERS = [
+    "sign in for reviews",
+    "you're seeing limited information",
+    "you are seeing limited information",
+    "seeing limited information",
+]
+
+
+def _panel_has_reviews_section(page) -> bool:
+    """True when the open panel exposes ANY reviews affordance.
+
+    One evaluate() checks every signal at once: review-tab buttons (scoped
+    to the panel, excluding the feed cards and the legal-disclosure link),
+    review-text spans, and the limited-view banner. Returns False quickly
+    when Google served a limited panel — the caller skips the whole review
+    extraction instead of timing out against nothing.
+    """
+    try:
+        out = page.evaluate(
+            """() => {
+                const panel = document.querySelector('div[role="main"]')
+                             || document.body;
+                if (!panel) return {has: false, limited: false};
+                const txt = (panel.innerText || '').toLowerCase();
+                for (const m of %s) {
+                    if (txt.includes(m)) return {has: false, limited: true};
+                }
+                // Review tab buttons (not the feed's, not the legal link)
+                const btns = panel.querySelectorAll(
+                    'button[aria-label*="review" i], button[jsaction*="review"]');
+                for (const b of btns) {
+                    const a = (b.getAttribute('aria-label') || '').toLowerCase();
+                    if (a.includes('legal') || a.includes('write a review'))
+                        continue;
+                    if (b.closest('div[role="feed"]')) continue;
+                    return {has: true, limited: false};
+                }
+                if (panel.querySelector('span[class*="wiI7pd"],'
+                                        + ' div[class*="jftiEf"]')) {
+                    return {has: true, limited: false};
+                }
+                // Rating row present but no reviews affordance anywhere:
+                // on the current layout this is a limited panel.
+                const stars = panel.querySelectorAll('div.F7nice').length;
+                return {has: false, limited: stars > 0};
+            }""" % _js_array(_LIMITED_VIEW_MARKERS))
+        if isinstance(out, dict):
+            return bool(out.get("has")), bool(out.get("limited"))
+        return False, False
+    except Exception:  # noqa: BLE001 — treat as "unknown, try the old path"
+        return True, False
+
+
+def _js_array(items) -> str:
+    import json as _json
+    return _json.dumps(list(items))
 
 _REVIEW_NOISE_RE = re.compile(
     r"\b\d+\s+reviews?\b|\b\d+\s+photos?\b"
@@ -145,17 +204,98 @@ def clean_review_text(text: str) -> str:
 
 
 def open_reviews_tab(page) -> bool:
-    """Click the Reviews tab so the review feed becomes the scroll target."""
+    """Click the Reviews tab so the review feed becomes the scroll target.
+
+    PERF: the fixed 1.5s post-click sleep is replaced by a bounded wait for
+    the review feed to actually appear (wait_for_selector), i.e.
+    condition-based instead of blind. The tab button itself gets a short
+    visibility wait first — on a freshly-clicked card panel the button can
+    still be hydrating, which is why the old code often failed to open the
+    tab at all and then burned scroll passes on a feed that never existed.
+    """
     for sel in _REVIEW_TAB_SELECTORS:
         try:
             loc = page.locator(sel).first
+            if loc.count() > 0:
+                try:
+                    loc.wait_for(state="visible", timeout=2500)
+                except Exception:  # noqa: BLE001 — still try the click
+                    pass
             if loc.count() > 0 and loc.is_visible():
                 loc.click(timeout=4000)
-                time.sleep(1.5)
+                try:
+                    page.wait_for_selector(
+                        ",".join(_REVIEW_TEXT_SELECTORS), timeout=4000)
+                except Exception:  # noqa: BLE001 — some panels are slow
+                    time.sleep(0.8)
                 return True
         except Exception:
             continue
     return False
+
+
+def review_dialog_open(page) -> bool:
+    """True when a reviews dialog overlay is currently covering the panel.
+
+    The dialog intercepts card clicks (the next listing's click lands on the
+    backdrop and the URL never switches — the 8s timeout path). The caller
+    closes it before clicking the next result card.
+    """
+    try:
+        return page.locator(
+            'div[role="dialog"], div[class*="review-dialog"]').count() > 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def close_review_dialog(page) -> None:
+    """Best-effort close of an open reviews dialog (Escape, like a human)."""
+    try:
+        if review_dialog_open(page):
+            page.keyboard.press("Escape")
+            try:
+                page.wait_for_selector(
+                    'div[role="dialog"]', state="hidden", timeout=2000)
+            except Exception:  # noqa: BLE001 — best effort
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _read_review_texts_batched(page, max_reviews: int) -> list:
+    """ONE evaluate() round-trip: read every visible review body text.
+
+    PERF (Fix B): replaces the per-node inner_text() loop (~n round-trips per
+    pass). The SAME selectors and the SAME min-length screen are applied in
+    JS; results still flow through clean_review_text in Python so the output
+    contract is identical.
+    """
+    import json as _json
+    js = """(args) => {
+        const [selsJson, maxReviews] = args;
+        const sels = JSON.parse(selsJson);
+        const out = [];
+        for (const sel of sels) {
+            try {
+                const nodes = document.querySelectorAll(sel);
+                for (const el of nodes) {
+                    const t = (el.textContent || '').trim();
+                    if (t && t.length >= 25 && out.length < maxReviews) {
+                        out.push(t);
+                    }
+                }
+                if (out.length) break;
+            } catch (e) { /* invalid selector - try next */ }
+        }
+        return out;
+    }"""
+    try:
+        raw = page.evaluate(js, [_json.dumps(_REVIEW_TEXT_SELECTORS),
+                                 max_reviews])
+        return [clean_review_text(t) for t in (raw or [])
+                if t and len(t) >= 25]
+    except Exception:  # noqa: BLE001 — fall back to per-node reads
+        return []
 
 
 def extract_reviews_from_panel(page, max_reviews: int = 5,
@@ -164,14 +304,45 @@ def extract_reviews_from_panel(page, max_reviews: int = 5,
 
     ``open_tab`` first clicks the Reviews tab (so the feed becomes scrollable),
     then repeatedly scrolls and harvests unique review bodies.
+
+    PERF (Fix B): each scroll pass now reads ALL visible reviews in ONE
+    evaluate() instead of per-node round-trips. A failed tab open now means
+    the feed never existed — return [] immediately instead of burning
+    scroll passes against nothing. Google's "limited view" panels (rolled
+    out Feb 2026, still served to logged-out sessions) expose NO reviews
+    affordance at all — detected up front in one evaluate(), the whole
+    extraction is skipped in milliseconds.
+    The reviews dialog is closed before returning so it cannot intercept
+    the next result-card click.
     """
     texts: list = []
     seen: set = set()
     if open_tab:
         try:
-            open_reviews_tab(page)
+            has_section, limited = _panel_has_reviews_section(page)
         except Exception:
-            pass
+            has_section, limited = True, False
+        if not has_section:
+            if limited:
+                log.debug("limited-view panel: reviews section absent — "
+                          "skipping review extraction")
+            return []
+        try:
+            opened_ok = open_reviews_tab(page)
+        except Exception:
+            opened_ok = False
+        if not opened_ok:
+            return []
+
+    # First read before scrolling: the first batch often already fills the
+    # quota for small feeds (zero extra scroll passes needed).
+    for t in _read_review_texts_batched(page, max_reviews):
+        if t not in seen:
+            seen.add(t)
+            texts.append(t)
+    if len(texts) >= max_reviews:
+        close_review_dialog(page)
+        return texts[:max_reviews]
 
     # Several scrolling passes; the feed lives inside the detail panel.
     scroll_attempts = max(3, max_reviews)
@@ -187,22 +358,15 @@ def extract_reviews_from_panel(page, max_reviews: int = 5,
                 page.mouse.wheel(0, 1800)
         except Exception:
             page.mouse.wheel(0, 1800)
-        page.wait_for_timeout(500)
-        for sel in _REVIEW_TEXT_SELECTORS:
-            try:
-                locs = page.locator(sel)
-                n = locs.count()
-                for i in range(n):
-                    txt = locs.nth(i).inner_text(timeout=1500).strip()
-                    txt = clean_review_text(txt)
-                    # Require a substantive body: chrome-only residues are dropped.
-                    if txt and len(txt) >= 25 and txt not in seen:
-                        seen.add(txt)
-                        texts.append(txt)
-                        if len(texts) >= max_reviews:
-                            return texts[:max_reviews]
-            except Exception:
-                continue
+        page.wait_for_timeout(400)
+        for t in _read_review_texts_batched(page, max_reviews):
+            if t not in seen:
+                seen.add(t)
+                texts.append(t)
+                if len(texts) >= max_reviews:
+                    close_review_dialog(page)
+                    return texts[:max_reviews]
+    close_review_dialog(page)
     return texts[:max_reviews]
 
 

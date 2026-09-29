@@ -506,6 +506,19 @@ class Pipeline:
             self._committer_thread.join(
                 timeout=max(0.0, deadline - time.monotonic()))
 
+    def _collect_records(self, query: str):
+        """Dispatch to the parallel Maps fan-out when maps.workers > 1.
+
+        The collector itself owns the worker model (contexts, slicing,
+        challenge fallback); the pipeline only picks the entry point, so
+        DemoCollector (no collect_parallel) and tests keep working with the
+        plain serial collect().
+        """
+        workers = getattr(self.cfg.maps, "workers", 1) or 1
+        if workers > 1 and hasattr(self.collector, "collect_parallel"):
+            return self.collector.collect_parallel(query, workers=workers)
+        return self.collector.collect(query)
+
     def _produce_query(self, query: str) -> None:
         """Producer stage: stream Maps listings into the enrichment queue.
 
@@ -515,7 +528,7 @@ class Pipeline:
         """
         keyword = self._split_keyword(query)
         self._query_collected = 0
-        for raw in self.collector.collect(query):
+        for raw in self._collect_records(query):
             self.counters["collected"] += 1
             self._query_collected += 1
             rec = self._normalize_record(raw, query, keyword)

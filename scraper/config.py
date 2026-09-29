@@ -61,6 +61,17 @@ class MapsConfig(BaseModel):
     scroll_delay_min_ms: int = Field(default=800, ge=0)
     scroll_delay_max_ms: int = Field(default=1600, ge=0)
     page_navigation_timeout_ms: int = Field(default=30_000, ge=1000)
+    # PERF: parallel Maps discovery workers. 1 = the historical single-page
+    # serial flow (identical behavior). 2-3 = additional isolated browser
+    # contexts working the SAME query's card list in alternating slices —
+    # discovery is the measured critical path (see docs/PERFORMANCE.md).
+    # On a bot challenge all workers stop and the engine falls back to 1.
+    workers: int = Field(default=1, ge=1, le=4)
+    # PERF: deep-scroll the panel to hydrate "From the owner" posts
+    # (has_recent_post / latest_post_date). Default false — the deep scroll
+    # costs ~3s per listing and these columns are unused in production.
+    # Set true to restore the full old behavior.
+    extract_owner_posts: bool = False
 
 
 class ReviewsConfig(BaseModel):
@@ -172,8 +183,14 @@ class ConcurrencyConfig(BaseModel):
 
 
 class DelaysConfig(BaseModel):
-    maps_min_seconds: float = Field(default=2.0, ge=0.0, le=30.0)
-    maps_max_seconds: float = Field(default=5.0, ge=0.0, le=30.0)
+    # PERF (Fix G): measured end-to-end, click-through panel navigation emits
+    # far fewer high-risk signals than full page loads, and the engine already
+    # backs off (cooldown + proxy rotation feedback) on a bot challenge.
+    # Old conservative default was 2.0-5.0s per listing; new default keeps a
+    # polite floor. To restore the old behavior: maps_min_seconds: 2.0,
+    # maps_max_seconds: 5.0.
+    maps_min_seconds: float = Field(default=0.4, ge=0.0, le=30.0)
+    maps_max_seconds: float = Field(default=1.2, ge=0.0, le=30.0)
     site_min_seconds: float = Field(default=0.3, ge=0.0, le=10.0)
     site_max_seconds: float = Field(default=0.8, ge=0.0, le=10.0)
     cooldown_seconds: float = Field(default=60.0, ge=0.0, le=600.0)

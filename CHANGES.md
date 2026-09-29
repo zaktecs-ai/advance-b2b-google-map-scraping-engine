@@ -727,3 +727,63 @@ Tests (`tests/test_photo_columns.py`, 4): pure parsing, schema position/count,
 e2e CSV export order + values, old-CSV migration rebuild.
 
 Suite: 242 → 245 passing.
+
+---
+
+## PERF-2026-09 — Google Maps discovery 5–8× (forensic, live-measured)
+
+Baseline (MEASURED on real Google Maps with the real collector, plus owner
+production numbers: 2000 leads / 8–9h ≈ 15.3s/lead): the serial Maps browser
+was the critical path — enrichment pool (150 rec/s measured on the mock
+benchmark) sat ~2000× starved. Suite grew 272 → 290 passing tests.
+
+Root causes found (each live-verified before fixing):
+- **P01 — identity wait grabbed the feed's h1.** `querySelector('h1')`
+  matched the results-feed "Results" heading (DOM order) — never the panel
+  h1 — so the combined wait burned its full 8s timeout + 1s fallback sleep
+  on EVERY listing. Fix: panel-first selector chain
+  (`h1.DUwDvf / fontHeadline` then non-feed h1 fallback).
+- **P02 — exact-href card matching failed in production.** Google churns
+  card hrefs (tracking params) every render; the `href == place_url` check
+  failed → every listing fell back to a full `page.goto` navigation
+  (~4–8s). Fix: `!1s0x…:0x…` place-id token matching for both the card map
+  and the panel-switch proof (clicks now ~0.4s, verified live).
+- **P03 — reviews burned 7.2s against panels with no reviews section.**
+  Google's "limited view" (Feb 2026 rollout, still active for logged-out
+  sessions) serves panels with the reviews section entirely absent. Fix:
+  one evaluate() detects the affordance (tab buttons scoped to the panel,
+  review spans, limited-view banner) → skip in ~0.02s instead of timing out.
+  Where reviews exist, extraction is unchanged (batched reads).
+- **P04 — O(n²) card scan.** Every listing re-scanned every result card via
+  per-card get_attribute round-trips. Fix: one evaluate() builds a
+  per-selector token→index map once per query (indices are per-selector —
+  a cross-selector index click was caught and fixed during bring-up).
+- **P05 — per-node round-trips.** Social links: 66 anchors → 1.27s
+  (measured) → one batched evaluate 0.026s (49×). Photo columns: per-selector
+  locator waits (1.5s, chips often not rendered) → one batched evaluate
+  (~0.005s). Panel fields (name/category/address/phone/website/plus_code/
+  hours/status/claim/rating): ~20 locator reads → 1–2 evaluate() calls with
+  per-field fallback preserved.
+- **P06 — fixed sleeps.** settle_panel 4×400ms → one in-page evaluate,
+  condition-based (returns when panel scroll height stabilizes). Photos
+  600ms fixed → condition-based. Reviews tab-open 1.5s → wait_for_selector.
+- **P07 — owner-post deep scroll (~3s/listing) served two columns the
+  owner confirmed are unused.** Fix: `maps.extract_owner_posts` gate
+  (default false; `true` restores the exact old behavior + columns).
+- **P08 — pacing defaults.** `delays.maps_*` 2.0–5.0 → 0.4–1.2 (comment in
+  config.yaml explains how to restore conservative values; anti-bot
+  cooldown/challenge handling unchanged).
+
+New capability:
+- **P09 — `maps.workers` (default 1 = identical serial behavior; ships as
+  2 in config.yaml).** Feed discovery stays serial (one context scrolls +
+  builds the card list); per-listing extraction fans out across N isolated
+  browser contexts working alternating slices of the same card list. Dedup
+  identity is worker-independent (pipeline identity keys unchanged). A
+  single-IP VPS should stay at 2 (higher = more CAPTCHA risk).
+
+Verification: 290/290 tests pass; live probes on real Google Maps
+(plumbers Houston + dentists Dallas): raw per-listing 10.4–15.3s →
+1.9–3.3s across runs; round-trips/listing 251 → 34–39; data spot-check
+(name/rating/review_count/cover image/category/address/phone) all correct.
+Full breakdown + reproduction steps: docs/PERFORMANCE.md.

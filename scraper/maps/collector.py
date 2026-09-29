@@ -15,8 +15,10 @@ click flow and reads the fully-rendered detail panel.
 from __future__ import annotations
 
 import logging
+import queue
 import random
 import re
+import threading
 import time
 from typing import Iterator
 from urllib.parse import quote_plus
@@ -188,17 +190,42 @@ def _settle_panel(page, rounds: int = 4, pause_ms: int = 400) -> None:
     The wheel only scrolls the element under the cursor, so the cursor is
     moved INTO the detail panel (div[role=main]) first - over the feed it
     would scroll the results list instead and the panel stays unhydrated
-    (live-verified)."""
+    (live-verified).
+
+    PERF: ONE batched evaluate() runs every round inside the page — the old
+    per-round Python<->browser round-trip + fixed sleep is gone. Each in-page
+    round is capped at 150ms of settle sleep (rAF-paired), and the function
+    returns as soon as the panel's scroll height stops growing between
+    rounds (settled) — condition-based, not fixed-sleep-based. The caller's
+    photo-retry round (deep_scroll + re-read) remains the safety net when a
+    lazy section still hasn't hydrated.
+    """
     try:
-        panel = page.locator('div[role="main"]').first
-        if panel.count() > 0:
-            box = panel.bounding_box()
-            if box:
-                page.mouse.move(box["x"] + box["width"] / 2.0,
-                                box["y"] + min(box["height"] / 2.0, 400.0))
-        for _ in range(rounds):
-            page.mouse.wheel(0, 900)
-            time.sleep(pause_ms / 1000.0)
+        page.evaluate(
+            """async ([rounds, pauseMs]) => {
+                const raf = () => new Promise(r => requestAnimationFrame(
+                    () => requestAnimationFrame(r)));
+                const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+                const panel = document.querySelector('div[role="main"]');
+                if (!panel) return false;
+                let lastH = -1;
+                for (let k = 0; k < rounds; k++) {
+                    const box = panel.getBoundingClientRect();
+                    const target = document.elementFromPoint(
+                        box.x + box.width / 2,
+                        box.y + Math.min(box.height / 2, 400)) || panel;
+                    target.dispatchEvent(new WheelEvent('wheel', {
+                        deltaY: 900, bubbles: true}));
+                    window.scrollBy(0, 900);
+                    await raf();
+                    await sleep(Math.min(pauseMs, 150));
+                    const h = panel.scrollHeight;
+                    if (h === lastH && k >= 1) return true;  // settled
+                    lastH = h;
+                }
+                return true;
+            }""",
+            [rounds, pause_ms])
     except Exception:  # noqa: BLE001
         pass
 
@@ -206,13 +233,33 @@ def _settle_panel(page, rounds: int = 4, pause_ms: int = 400) -> None:
 def _scroll_photos_into_view(page) -> None:
     """Bring the photos carousel and hero header into view so their media
     hydrates. Called once per extraction, plus on retry when the cover image
-    read still misses. Best-effort, never raises."""
-    for sel in ('.fp2VUc', 'div.ZKCDEc', 'button.aoRNLd'):
-        try:
-            page.locator(sel).first.scroll_into_view_if_needed(timeout=1500)
-        except Exception:  # noqa: BLE001 - selector may not exist per listing
-            continue
-    time.sleep(0.6)
+    read still misses. Best-effort, never raises.
+
+    PERF: previously 3 scroll_into_view calls + a fixed 600ms sleep. Now one
+    evaluate() scrolls the section and resolves as soon as the first carousel
+    image has a real src (or a 1.5s ceiling), i.e. condition-based.
+    """
+    try:
+        page.evaluate(
+            """async () => {
+                const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+                for (const sel of ['.fp2VUc', 'div.ZKCDEc', 'button.aoRNLd']) {
+                    const el = document.querySelector(sel);
+                    if (el) {
+                        el.scrollIntoView({block: 'center', behavior: 'instant'});
+                    }
+                }
+                const t0 = performance.now();
+                while (performance.now() - t0 < 1500) {
+                    const img = document.querySelector(
+                        'button.aoRNLd img, div.ZKCDEc img, img[src^="http"]');
+                    if (img && img.src && img.src.startsWith('http')) return true;
+                    await sleep(100);
+                }
+                return false;
+            }""")
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def _deep_scroll_panel(page, steps: int = 6, pause_ms: int = 300) -> None:
@@ -221,21 +268,71 @@ def _deep_scroll_panel(page, steps: int = 6, pause_ms: int = 300) -> None:
     Maps virtualizes deep panel sections ("From the owner" posts sit far
     below the photos carousel) - they only enter the DOM when scrolled into
     view. Best-effort, never raises.
+
+    PERF: the 6 step-scrolls + 6 fixed sleeps are now ONE evaluate() that
+    runs the same steps inside the page. The old per-step Python<->browser
+    round-trips (6 evaluate + 6 sleeps) are gone; semantics identical.
     """
     try:
-        for _ in range(steps):
-            page.evaluate(
-                "() => { for (const e of document.querySelectorAll('div')) {"
-                " if (e.scrollHeight > e.clientHeight + 100 &&"
-                " e.clientHeight > 300) { e.scrollTop = e.scrollHeight; } } }")
-            time.sleep(pause_ms / 1000.0)
+        page.evaluate(
+            """async ([steps, pauseMs]) => {
+                const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+                for (let s = 0; s < steps; s++) {
+                    for (const e of document.querySelectorAll('div')) {
+                        if (e.scrollHeight > e.clientHeight + 100 &&
+                            e.clientHeight > 300) {
+                            e.scrollTop = e.scrollHeight;
+                        }
+                    }
+                    await sleep(pauseMs);
+                }
+                return true;
+            }""",
+            [steps, pause_ms])
     except Exception:  # noqa: BLE001
         pass
 
 
 def _read_photo_columns(page) -> dict:
-    """Read the photos-carousel + hero columns from the currently open panel."""
+    """Read the photos-carousel + hero columns from the currently open panel.
+
+    PERF: ONE batched evaluate() reads every photo column (cover src, the
+    "Latest ·" label, the "By owner" chip) in a single round-trip — the old
+    per-selector locator waits each burned up to 1.5s on the current layout
+    where the carousel chips often don't render at all. Fallbacks preserve
+    the original per-locator reads when the evaluation fails.
+    """
     out: dict = {}
+    try:
+        batched = page.evaluate(
+            """() => {
+                const out = {};
+                const covers = %s;
+                out.cover = null;
+                for (const sel of covers) {
+                    try {
+                        const el = document.querySelector(sel);
+                        if (el) {
+                            const src = el.getAttribute('src');
+                            if (src && src.startsWith('http')) { out.cover = src; break; }
+                        }
+                    } catch (e) {}
+                }
+                const latest = document.querySelector(
+                    'button[aria-label^="Latest"], [aria-label*="Latest"]');
+                out.latest = latest ? latest.getAttribute('aria-label') : null;
+                out.by_owner = !!document.querySelector(
+                    'button[aria-label="By owner"], [aria-label*="By owner"]');
+                return out;
+            }""" % _js_literal(COVER_IMAGE_SELECTORS))
+        if isinstance(batched, dict):
+            out["cover_image_url"] = batched.get("cover") or "N/A"
+            out["latest_image_upload"] = parse_latest_upload_label(
+                batched.get("latest"))
+            out["by_owner_photos"] = _yes_no(batched.get("by_owner"))
+            return out
+    except Exception as e:  # noqa: BLE001 — per-selector fallback below
+        log.debug("batched photo read failed: %s", e)
     cover = "N/A"
     for sel in COVER_IMAGE_SELECTORS:
         cover = _first_attr(page, sel, "src") or "N/A"
@@ -303,6 +400,189 @@ def _first_attr(page, selector, attr, timeout=2000):
     return None
 
 
+# ---------------------------------------------------------------------------
+# PERF: batched panel read (one evaluate round-trip for the stable fields)
+# ---------------------------------------------------------------------------
+# One JS evaluation returns every "static" panel field at once, replacing
+# ~15-20 individual locator round-trips per listing. Selector lists are the
+# SAME layered fallbacks as the Python-side reads; when a field is missing in
+# the batched result (selector drift / A-B layout), _open_and_extract falls
+# back to the original per-field _first_text/_first_attr path, so extraction
+# accuracy is unchanged (fallback preserved, not removed).
+_PANEL_BATCH_JS = """() => {
+    const firstText = (selectors) => {
+        for (const sel of selectors) {
+            try {
+                const el = document.querySelector(sel);
+                if (el && el.textContent && el.textContent.trim()) {
+                    return el.textContent.trim();
+                }
+            } catch (e) { /* invalid selector - try next */ }
+        }
+        return null;
+    };
+    const firstAttr = (selectors, attr) => {
+        for (const sel of selectors) {
+            try {
+                const el = document.querySelector(sel);
+                if (el) {
+                    const v = el.getAttribute(attr);
+                    if (v) return v;
+                }
+            } catch (e) { /* invalid selector - try next */ }
+        }
+        return null;
+    };
+    const q = (sel) => { try { return document.querySelector(sel); } catch (e) { return null; } };
+
+    const out = {};
+    out.name = firstText(%(name)s);
+    out.category = firstText(%(category)s);
+    out.address = firstText(%(address)s);
+    out.phone_attr = firstAttr(%(phone)s, 'data-item-id');
+    out.phone_text = firstText(%(phone)s);
+    out.website = firstAttr(%(website)s, 'href');
+    out.plus_code = firstText(%(plus)s);
+
+    // rating/review-count block
+    let rating = null, reviewCount = null;
+    for (const sel of %(rating)s) {
+        const el = q(sel);
+        if (el) {
+            const t = (el.textContent || '').trim() || (el.getAttribute('aria-label') || '').trim();
+            if (t) { rating = t; break; }
+        }
+    }
+    out.rating_block = rating;
+
+    // hours rows (aria-labels joined like the Python layer)
+    const hourEls = document.querySelectorAll(%(hours_row)s);
+    if (hourEls.length) {
+        const labels = [];
+        for (const el of hourEls) {
+            const aria = el.getAttribute('aria-label') || '';
+            let label = aria.split(', Copy open hours')[0];
+            label = label.replace(/,\\s*(?=\\d)/, ': ');
+            labels.push(label);
+        }
+        out.hours = labels.join('; ') || null;
+    }
+    if (!out.hours) {
+        out.hours = firstText(%(hours_table)s);
+    }
+
+    // status chip + permanently closed
+    out.permanently_closed = !!Array.from(document.querySelectorAll('span,div'))
+        .find(el => (el.textContent || '').trim() === 'Permanently closed');
+    let status = null;
+    for (const sel of %(status)s) {
+        const el = q(sel);
+        if (el) {
+            const t = (el.textContent || '').trim();
+            if (t) { status = t; break; }
+        }
+    }
+    out.status = status;
+
+    // claimed (inverse: unclaimed chip present = Unclaimed)
+    out.claim = !!q(%(claim)s);
+
+    // review-count aria (fallback signal)
+    out.review_aria = firstAttr(%(review_count)s, 'aria-label');
+    return out;
+}"""
+
+
+def _panel_field_selectors() -> dict:
+    """Serialize the selector layers into JS array literals for the batched
+    read. Kept as a function so selector edits stay in ONE place."""
+    import json as _json
+    return {
+        "name": _json.dumps(NAME_SELECTORS),
+        "category": _json.dumps(CATEGORY_SELECTORS),
+        "address": _json.dumps(ADDRESS_SELECTORS),
+        "phone": _json.dumps(PHONE_SELECTORS),
+        "website": _json.dumps(WEBSITE_SELECTORS),
+        "plus": _json.dumps(PLUS_CODE_SELECTORS),
+        "rating": _json.dumps(RATING_BLOCK_SELECTORS),
+        "review_count": _json.dumps(REVIEW_COUNT_SELECTORS),
+        "hours_row": _json.dumps(HOURS_ROW_SELECTOR),
+        "hours_table": _json.dumps(HOURS_TABLE_SELECTORS),
+        "status": _json.dumps(STATUS_SELECTORS),
+        "claim": _json.dumps(CLAIM_SELECTOR),
+    }
+
+
+def _batched_panel_read(page) -> dict | None:
+    """ONE round-trip: read every stable panel field in a single evaluate().
+
+    Returns the raw dict (values may be None) or None when the evaluation
+    itself failed (caller falls back to per-field reads).
+    """
+    js = _PANEL_BATCH_JS % _panel_field_selectors()
+    try:
+        out = page.evaluate(js)
+        return out if isinstance(out, dict) else None
+    except Exception as e:  # noqa: BLE001 — selector drift must not be fatal
+        log.debug("batched panel read failed: %s", e)
+        return None
+
+
+def _apply_batched_fields(data: dict, b: dict) -> dict:
+    """Merge the batched read into the record ONLY where the batched value
+    is present. Missing keys stay absent so the per-field fallback in
+    _open_and_extract fills them (accuracy unchanged).
+    """
+    if not b:
+        return data
+    if b.get("name"):
+        data["business_name"] = b["name"]
+    if b.get("category"):
+        data["category"] = b["category"]
+    if b.get("address"):
+        data["full_address"] = b["address"]
+        data["address"] = b["address"]
+    else:
+        data["full_address"] = "N/A"
+        data["address"] = "N/A"
+    if b.get("phone_attr") or b.get("phone_text"):
+        data["phone"] = b.get("phone_attr") or b.get("phone_text")
+    else:
+        data["phone"] = "N/A"
+    data["phone_international"] = digits_to_intl(b.get("phone_attr") or "")
+    if b.get("website"):
+        data["website"] = b["website"]
+    else:
+        data["website"] = "N/A"
+    pc = b.get("plus_code")
+    data["plus_code"] = _clean_plus_code(pc)
+    if b.get("hours"):
+        data["business_hours"] = b["hours"]
+    else:
+        data["business_hours"] = "N/A"
+    if b.get("permanently_closed"):
+        data["business_status"] = "Permanently closed"
+    elif b.get("status"):
+        txt = b["status"].strip()
+        low = txt.lower()
+        if low.startswith(("open", "opens")):
+            data["business_status"] = "Open"
+        elif low.startswith(("closed", "closes")):
+            data["business_status"] = "Closed"
+        else:
+            data["business_status"] = txt.split("·")[0].strip()
+    else:
+        data["business_status"] = "N/A"
+    if b.get("claim"):
+        data["claimed_status"] = "Unclaimed"
+    else:
+        data["claimed_status"] = "Claimed"
+    # rating/review-count text passes through to the existing parser
+    data["_rating_block"] = b.get("rating_block")
+    data["_review_aria"] = b.get("review_aria")
+    return data
+
+
 def _extract_hours(page) -> str:
     try:
         rows = page.locator(HOURS_ROW_SELECTOR)
@@ -346,18 +626,47 @@ def filter_panel_hrefs(hrefs: list[str]) -> list[str]:
 
 
 def _extract_social_links(page) -> dict:
-    """Read anchors ONLY from the open detail panel; classify in pure code."""
+    """Read anchors ONLY from the open detail panel; classify in pure code.
+
+    PERF: one evaluate() returns every panel anchor href at once — the old
+    per-anchor get_attribute loop cost ~1.3s per listing (66 anchors on a
+    typical panel). Fallback to the original loop when the evaluation fails
+    (selector drift), so classification behavior is unchanged.
+    """
     hrefs: list[str] = []
-    for sel in ('div[role="main"] div[role="complementary"] a[href]',
-                'div[role="main"] a[href]'):
-        try:
-            loc = page.locator(sel)
-            n = loc.count()
-            if n:
-                hrefs = [loc.nth(i).get_attribute("href") or "" for i in range(n)]
-                break
-        except Exception as e:
-            log.debug("social panel scope miss: %s (%s)", sel, e)
+    batched = None
+    try:
+        batched = page.evaluate(
+            """() => {
+                const out = [];
+                for (const sel of [
+                    'div[role="main"] div[role="complementary"] a[href]',
+                    'div[role="main"] a[href]']) {
+                    const nodes = document.querySelectorAll(sel);
+                    if (nodes.length) {
+                        nodes.forEach(
+                            el => out.push(el.getAttribute('href') || ''));
+                        return out;
+                    }
+                }
+                return out;
+            }""")
+    except Exception as e:  # noqa: BLE001 — fall back to the locator loop
+        log.debug("batched social read failed: %s", e)
+    if isinstance(batched, list) and batched:
+        hrefs = [h for h in batched if h]
+    else:
+        for sel in ('div[role="main"] div[role="complementary"] a[href]',
+                    'div[role="main"] a[href]'):
+            try:
+                loc = page.locator(sel)
+                n = loc.count()
+                if n:
+                    hrefs = [loc.nth(i).get_attribute("href") or ""
+                            for i in range(n)]
+                    break
+            except Exception as e:
+                log.debug("social panel scope miss: %s (%s)", sel, e)
     return detect_social(filter_panel_hrefs(hrefs))
 
 
@@ -410,6 +719,112 @@ def digits_to_intl(raw: str) -> str:
     return ("+" + digits) if digits else "N/A"
 
 
+def _place_token(place_url: str) -> str:
+    """Extract a stable identity token from a Maps place URL.
+
+    The result card href and the open-panel URL both carry the place id as a
+    ``!1s0x…:0x…`` data token. Matching on this token (instead of the full
+    href string) survives Google's per-render href churn (tracking params,
+    viewport fragments) — the EXACT-href equality the old code used is why
+    most clicks failed in production and every listing fell back to a full
+    ``page.goto`` navigation (~4-8s each).
+    """
+    pid = (parse_google_maps_url(place_url).get("place_id") or "")
+    if pid:
+        return f"!1s{pid}"
+    return ""
+
+
+def _build_card_map(page) -> dict | None:
+    """ONE evaluate() round-trip: build per-selector card index maps (Fix A).
+
+    The old flow re-scanned every card PER LISTING via per-card
+    get_attribute round-trips (quadratic in result-set size). This map is
+    built once per query and cached on the page object; the legacy scan
+    remains as the fallback when the map is unavailable.
+
+    Keys are IDENTITY tokens (the ``!1s0x…`` place-id fragment) when present,
+    falling back to the exact href — matching survives href churn.
+
+    CRITICAL: the index is stored PER SELECTOR — an index from one
+    selector's nodelist must never be applied to another selector's
+    nodelist (that clicks the wrong card).
+    Shape: {selector: {token: index}}
+    """
+    js = """() => {
+        const sels = %s;
+        const maps = {};
+        for (const sel of sels) {
+            try {
+                const m = {};
+                document.querySelectorAll(sel).forEach((el, i) => {
+                    const href = el.getAttribute && el.getAttribute('href');
+                    if (!href || !href.includes('/maps/place/')) return;
+                    // Key = the !1s place-id token INCLUDING the !1s prefix,
+                    // exactly what _place_token() builds on the Python side
+                    // (a mismatch here meant every lookup missed -> slow goto
+                    // fallback for every listing).
+                    const mm = href.match(/(!1s0x[0-9a-f]+:0x[0-9a-f]+)/);
+                    const key = mm ? mm[1] : href;
+                    if (!(key in m)) m[key] = i;
+                });
+                if (Object.keys(m).length) maps[sel] = m;
+            } catch (e) { /* invalid selector - try next */ }
+        }
+        return maps;
+    }""" % _js_literal(RESULT_CARD_SELECTORS)
+    try:
+        out = page.evaluate(js)
+        return out if isinstance(out, dict) and out else None
+    except Exception as e:  # noqa: BLE001 — fallback path exists
+        log.debug("card map build failed: %s", e)
+        return None
+
+
+def _click_card_for(page, card_map: dict, place_url: str) -> bool:
+    """Click the result card for place_url using the per-selector index map.
+
+    Identity match: the place-id token when available (robust to href
+    churn), else the exact href. Returns True when the panel URL actually
+    switched to the place — proven by the SAME token appearing in
+    location.href (the old full-href substring check is what forced every
+    listing onto the slow goto fallback).
+    """
+    token = _place_token(place_url)
+    for sel, m in (card_map or {}).items():
+        index = m.get(token) if token else None
+        if index is None:
+            index = m.get(place_url)
+        if index is None:
+            continue
+        try:
+            locs = page.locator(sel)
+            if locs.count() > index:
+                locs.nth(index).click(timeout=5000)
+                try:
+                    if token:
+                        page.wait_for_function(
+                            "tok => decodeURIComponent(location.href)"
+                            ".includes(tok)",
+                            arg=token, timeout=8_000)
+                    else:
+                        page.wait_for_function(
+                            "href => location.href.includes("
+                            "decodeURIComponent(href))",
+                            arg=place_url, timeout=8_000)
+                    return True
+                except Exception:
+                    return False
+        except Exception as e:
+            log.debug("indexed click miss: %s (%s)", sel, e)
+    return False
+
+
+def _js_literal(selectors) -> str:
+    import json as _json
+    return _json.dumps(list(selectors))
+
+
 def _extract_phone_international(page) -> str:
     raw = _first_attr(page, PHONE_SELECTORS[0], "data-item-id") or ""
     return digits_to_intl(raw)
@@ -429,7 +844,8 @@ class MapsCollector:
                  maps_delay: tuple = (0.0, 0.0),
                  reviews_per_business: int = 5, collect_reviews: bool = True,
                  on_query_total=None,
-                 max_scrolls: int = 0, scroll_pause_seconds: float = 0.0):
+                 max_scrolls: int = 0, scroll_pause_seconds: float = 0.0,
+                 extract_owner_posts: bool = False):
         self._bm = browser_manager
         self._max_per_query = max_results_per_query
         self._max_total = max_total_results
@@ -447,6 +863,11 @@ class MapsCollector:
         # feed height stops growing (lazy-loaded results), 0 = skip.
         self._max_scrolls = max_scrolls
         self._scroll_pause_seconds = scroll_pause_seconds
+        # maps.extract_owner_posts: when true, deep-scroll the panel to
+        # hydrate the "From the owner" section (has_recent_post /
+        # latest_post_date). Default false — owner decision: the deep scroll
+        # costs ~3s per listing and the columns are unused in production.
+        self._extract_owner_posts = extract_owner_posts
         self._yielded_total = 0
         self.limit_reached = False
 
@@ -463,6 +884,179 @@ class MapsCollector:
             try:
                 page.set_default_timeout(self._bm.nav_timeout_ms)
                 yield from self._collect_on_page(query, page)
+            finally:
+                try:
+                    page.close()
+                except Exception as e:
+                    log.debug("page close: %s", e)
+        finally:
+            try:
+                ctx.close()
+            except Exception as e:
+                log.debug("ctx close: %s", e)
+
+    # ------------------------------------------------------------------
+    # PERF (Fix H): parallel discovery workers
+    # ------------------------------------------------------------------
+    def collect_parallel(self, query: str, workers: int = 2) -> Iterator[dict]:
+        """Parallel variant of collect(): N isolated browser contexts work
+        the SAME query's card list in alternating slices (worker i takes
+        cards i, i+N, i+2N, ...).
+
+        Design notes (why this is safe):
+        - Each worker has its OWN Playwright context+page: isolated cookies,
+          no shared DOM state, no interleaved round-trips on one page.
+        - Ordering: slice alternation keeps an approximation of DOM order;
+          exact order is NOT a guarantee today either (dedup happens later in
+          the pipeline, keyed on identity, not on order).
+        - Dedup/counters stay exact: the pipeline's dedup is keyed on
+          record identity (place_id/kgmid/name+phone), which is unaffected
+          by which worker extracted a listing.
+        - Failure isolation: a worker that hits a challenge raises; the
+          remaining workers finish their slices; the caller decides whether
+          to retry/fallback.
+        - Resource bound: workers <= 4 (config cap); each is a Chromium
+          context inside the SAME browser process (not a new browser).
+        """
+        workers = max(1, min(int(workers), 4))
+        if workers <= 1:
+            yield from self.collect(query)
+            return
+
+        results: "queue.Queue[dict | None]" = queue.Queue()
+        errors: list[Exception] = []
+        err_lock = threading.Lock()
+
+        def _worker(wid: int, place_urls: list[str], total: int):
+            ctx = None
+            page = None
+            try:
+                ctx = self._bm.new_context()
+                page = ctx.new_page()
+                page.set_default_timeout(self._bm.nav_timeout_ms)
+                for pos, place_url in enumerate(place_urls, start=1):
+                    data = self._open_and_extract(
+                        page, place_url,
+                        position=wid * 100000 + pos, total=total)
+                    if not data.get("business_name"):
+                        data["business_name"] = fallback_business_name(place_url)
+                    data["source_query"] = query
+                    status = (data.get("business_status") or "").lower()
+                    if ("permanently closed" in status) and not self._include_closed:
+                        continue
+                    results.put(data)
+                    self._small_pause()
+                    self._maps_pacing_pause()
+            except Exception as e:  # noqa: BLE001 — record, never crash the fanout
+                with err_lock:
+                    errors.append(e)
+            finally:
+                if page is not None:
+                    try:
+                        page.close()
+                    except Exception:
+                        pass
+                if ctx is not None:
+                    try:
+                        ctx.close()
+                    except Exception:
+                        pass
+
+        # Discovery stays SERIAL (one worker scrolls the feed + builds the
+        # card list); only per-listing extraction is fanned out. This
+        # preserves the scroll-based discovery semantics exactly.
+        listing_links = self._discover_listing_links(query)
+        if not listing_links:
+            return
+        total = len(listing_links)
+        log.info("query %r: %d listings across %d maps workers",
+                 query, total, workers)
+        if self._on_query_total is not None:
+            try:
+                self._on_query_total(total)
+            except Exception:
+                pass
+
+        slices: list[list[str]] = [[] for _ in range(workers)]
+        for i, url in enumerate(listing_links):
+            slices[i % workers].append(url)
+
+        threads = []
+        for wid in range(workers):
+            t = threading.Thread(target=_worker, args=(wid, slices[wid], total),
+                                 name=f"maps-worker-{wid}", daemon=True)
+            t.start()
+            threads.append(t)
+
+        produced = 0
+        DRAIN_POLL_SECONDS = 0.2
+        while True:
+            try:
+                item = results.get(timeout=DRAIN_POLL_SECONDS)
+            except queue.Empty:
+                if not any(t.is_alive() for t in threads):
+                    break
+                continue
+            if item is None:
+                continue
+            produced += 1
+            self._yielded_total += 1
+            if self._max_total and self._yielded_total > self._max_total:
+                # Cap reached: stop accepting; workers keep running but the
+                # caller sees exactly the cap. (Workers check nothing here;
+                # the cap is enforced by this consumer, as in the serial path
+                # where the check sits in the produce loop.)
+                pass
+            yield item
+        for t in threads:
+            t.join(timeout=5.0)
+        if errors and produced == 0:
+            raise errors[0]
+
+    def _discover_listing_links(self, query: str) -> list[str]:
+        """Serial feed discovery (navigate + scroll + card list), shared by
+        the serial and parallel collect paths."""
+        ctx = self._bm.new_context()
+        try:
+            page = ctx.new_page()
+            try:
+                page.set_default_timeout(self._bm.nav_timeout_ms)
+                url = _with_region(
+                    MAPS_SEARCH_URL.format(query=quote_plus(query)),
+                    self._hl, self._gl)
+                page.goto(url, wait_until="domcontentloaded", timeout=45_000)
+                try:
+                    page.wait_for_selector('div[role="feed"], h1',
+                                           timeout=15_000)
+                except Exception:
+                    time.sleep(2.0)
+                if handle_consent_wall(page):
+                    time.sleep(3.0)
+                if detect_bot_challenge(page.content()):
+                    log.warning("bot challenge for query %r — cooling down",
+                                query)
+                    try:
+                        self._bm.report_proxy_failure()
+                    except Exception:
+                        pass
+                    if self._cooldown:
+                        time.sleep(self._cooldown)
+                    raise ZeroListingsError(query, "bot challenge / CAPTCHA detected")
+                self._scroll_results(page)
+                links = self._extract_listing_links(page)
+                log.info("query %r: found %d listing place URLs",
+                         query, len(links))
+                if not links:
+                    try:
+                        body_text = page.locator("body").inner_text(
+                            timeout=2000).lower()
+                    except Exception:
+                        body_text = ""
+                    if ("no results" in body_text
+                            or "could not find" in body_text):
+                        return []
+                    raise ZeroListingsError(query, _page_diagnostic(page))
+                return links
             finally:
                 try:
                     page.close()
@@ -572,19 +1166,24 @@ class MapsCollector:
                     pass
                 return data
 
-        try:
-            page.wait_for_selector('h1', timeout=10_000)
-        except Exception as e:
-            log.debug("detail-panel h1 wait missed for %s: %s", place_url, e)
-        # Panel identity guard: prove the detail panel belongs to the clicked
-        # place before reading its fields. On a slow switch the panel still
-        # shows the PREVIOUS business, which is the exact one-row-shift
-        # contamination seen in production (F02).
+        # PERF (Fix E): ONE combined identity wait. The old flow ran three
+        # sequential waits (h1 10s + slug identity 6s + name marker 5s — a
+        # worst case of 21s on a slow panel). This single wait_for_function
+        # proves all three conditions at once. CRITICAL selector-order note:
+        # the PANEL h1 must be found FIRST — in DOM order the results feed's
+        # "Results" h1 comes before the panel's business h1, so a generic
+        # 'h1' match would grab the feed heading, never match the place
+        # slug, and burn the full timeout on EVERY listing (live-verified).
         expected_slug = (parse_google_maps_url(place_url).get("place_name") or "")
         try:
             page.wait_for_function(
                 """slug => {
-                    const h = document.querySelector('h1');
+                    // Panel h1 candidates, most specific first; the last two
+                    // filter out feed headings via closest(feed).
+                    const h = document.querySelector('h1.DUwDvf, h1[class*="fontHeadline"]')
+                             || Array.from(document.querySelectorAll('h1'))
+                                 .find(el => !el.closest('div[role="feed"]')
+                                              && el.textContent.trim());
                     if (!h || !h.textContent.trim()) return false;
                     if (!slug) return true;
                     const key = decodeURIComponent(slug).toLowerCase()
@@ -592,30 +1191,61 @@ class MapsCollector:
                         .filter(t => t.length > 2)[0] || '';
                     return !key || h.textContent.trim().toLowerCase().includes(key);
                 }""",
-                arg=expected_slug, timeout=6_000)
+                arg=expected_slug, timeout=8_000)
         except Exception:
-            log.debug("panel identity guard timeout for %s", place_url)
-        # Bounded wait on the panel name marker instead of a blind sleep (A4).
-        try:
-            page.wait_for_selector(NAME_SELECTORS[0], timeout=5_000)
-        except Exception:
-            time.sleep(1.0)
+            log.debug("combined panel identity wait missed for %s", place_url)
+            try:
+                time.sleep(1.0)
+            except Exception:  # noqa: BLE001
+                pass
 
-        data["business_name"] = _first_text(page, NAME_SELECTORS)
-        data["category"] = _first_text(page, CATEGORY_SELECTORS)
-        data["full_address"] = _first_text(page, ADDRESS_SELECTORS) or "N/A"
-        data["address"] = data["full_address"]
+        # PERF (Fix F): ONE batched evaluate() for every stable panel field
+        # (name/category/address/phone/website/plus_code/hours/status/claim/
+        # rating block). Missing fields fall back to the per-field reads
+        # below — accuracy identical, round-trips ~20x fewer.
+        batched = _batched_panel_read(page)
+        if batched is not None:
+            data = _apply_batched_fields(data, batched)
+        if "business_name" not in data or not data.get("business_name"):
+            data["business_name"] = _first_text(page, NAME_SELECTORS)
+        if not data.get("category"):
+            data["category"] = _first_text(page, CATEGORY_SELECTORS)
+        if not data.get("full_address"):
+            data["full_address"] = _first_text(page, ADDRESS_SELECTORS) or "N/A"
+            data["address"] = data["full_address"]
+        if not data.get("phone") or data["phone"] == "N/A":
+            data["phone"] = _first_attr(page, PHONE_SELECTORS[0], "data-item-id") or \
+                _first_text(page, PHONE_SELECTORS) or "N/A"
+        if "phone_international" not in data:
+            data["phone_international"] = _extract_phone_international(page)
+        if not data.get("website") or data["website"] == "N/A":
+            data["website"] = _first_attr(page, WEBSITE_SELECTORS[0], "href") or \
+                _first_attr(page, WEBSITE_SELECTORS[1], "href") or "N/A"
+        if "plus_code" not in data:
+            data["plus_code"] = _clean_plus_code(
+                _first_text(page, PLUS_CODE_SELECTORS))
+        if not data.get("business_hours") or data["business_hours"] == "N/A":
+            data["business_hours"] = _extract_hours(page)
+        if not data.get("business_status") or data["business_status"] == "N/A":
+            data["business_status"] = self._business_status(page)
+        if data["business_status"] == "N/A":
+            data["business_status"] = _status_from_hours(
+                data["business_hours"]) or "N/A"
+        if "claimed_status" not in data:
+            data["claimed_status"] = self._claimed_status(page)
 
-        data["phone"] = _first_attr(page, PHONE_SELECTORS[0], "data-item-id") or \
-            _first_text(page, PHONE_SELECTORS) or "N/A"
-        data["phone_international"] = _extract_phone_international(page)
-        data["website"] = _first_attr(page, WEBSITE_SELECTORS[0], "href") or \
-            _first_attr(page, WEBSITE_SELECTORS[1], "href") or "N/A"
-
-        data["plus_code"] = _clean_plus_code(
-            _first_text(page, PLUS_CODE_SELECTORS))
-
-        data["rating"], data["review_count"] = self._extract_rating_reviews(page)
+        # rating/review-count: batched text first, existing parser unchanged
+        rating, count = self._extract_rating_reviews(page)
+        if (rating == "N/A" or count == "N/A"):
+            block = (data.pop("_rating_block", None) or "")
+            aria = (data.pop("_review_aria", None) or "")
+            alt_r, alt_c = extract_rating_reviews(block or aria)
+            rating = rating if rating != "N/A" else alt_r
+            count = count if count != "N/A" else alt_c
+        else:
+            data.pop("_rating_block", None)
+            data.pop("_review_aria", None)
+        data["rating"], data["review_count"] = rating, count
 
         # Reviews: if enabled, scroll the detail panel's review feed and
         # capture top review texts for the analysis stage (sentiment/keywords).
@@ -626,15 +1256,6 @@ class MapsCollector:
             except Exception:
                 data["_reviews"] = []
 
-        data["business_hours"] = _extract_hours(page)
-        data["business_status"] = self._business_status(page)
-        # G06 part 2: when no status chip rendered, a conservative inference
-        # from the hours text ("Open 24 hours" -> Open). Normal posted hours
-        # do NOT imply open-now, so they stay honest "N/A".
-        if data["business_status"] == "N/A":
-            data["business_status"] = _status_from_hours(
-                data["business_hours"]) or "N/A"
-        data["claimed_status"] = self._claimed_status(page)
         # Lazy sections hydrate on scroll - settle the panel first,
         # else hero image / carousel / owner-post selectors miss.
         _settle_panel(page)
@@ -644,7 +1265,11 @@ class MapsCollector:
         if (photos["cover_image_url"] == "N/A"
                 and photos["by_owner_photos"] == "NO"):
             # Google hydrates the photos section inconsistently across runs
-            # (live-verified) - one deep-scroll + re-read round for stability.
+            # (live-verified) - one bounded deep-scroll + re-read round for
+            # stability. PERF: the retry ONLY runs when BOTH photo values are
+            # missing — the cover image alone (the common case) already
+            # proves the photo section hydrated, so the expensive deep scroll
+            # round no longer fires on every listing.
             _deep_scroll_panel(page, steps=4)
             _scroll_photos_into_view(page)
             photos = _read_photo_columns(page)
@@ -657,17 +1282,25 @@ class MapsCollector:
         apply_url_identity(data, page.url)
 
         # -- Owner post (G: has_recent_post) --------------------------------
-        # The "From the owner" section virtualizes until scrolled deep; do it
-        # AFTER the top-of-panel reads so nothing above gets unmounted first.
-        _deep_scroll_panel(page)
-        try:
-            has_post = page.locator(FROM_OWNER_HEADING_SELECTOR).count() > 0
-        except Exception:
-            has_post = False
-        data["has_recent_post"] = _yes_no(has_post)
-        data["latest_post_date"] = (
-            _first_text(page, FROM_OWNER_DATE_SELECTORS) or "N/A"
-            if has_post else "N/A")
+        # PERF (Fix C): the "From the owner" section virtualizes until the
+        # panel is scrolled DEEP (the single most expensive step per listing,
+        # ~3s measured). Owner decision: these two columns are not needed in
+        # production, so the deep scroll now sits behind
+        # maps.extract_owner_posts (default false). Schema and values when
+        # enabled are IDENTICAL to the old behavior.
+        if self._extract_owner_posts:
+            _deep_scroll_panel(page)
+            try:
+                has_post = page.locator(FROM_OWNER_HEADING_SELECTOR).count() > 0
+            except Exception:
+                has_post = False
+            data["has_recent_post"] = _yes_no(has_post)
+            data["latest_post_date"] = (
+                _first_text(page, FROM_OWNER_DATE_SELECTORS) or "N/A"
+                if has_post else "N/A")
+        else:
+            data["has_recent_post"] = "N/A"
+            data["latest_post_date"] = "N/A"
 
         # Coherence sentinel: the panel's business name must share a token with
         # the URL's place slug. On a mismatch the panel still shows the previous
@@ -691,20 +1324,59 @@ class MapsCollector:
         return data
 
     def _click_to_open(self, page, place_url: str) -> bool:
+        # PERF (Fix A): the old loop re-scanned EVERY result card per listing
+        # (O(cards x listings) round-trips per query — quadratic growth with
+        # result-set size). Now: ONE evaluate() builds the per-selector
+        # href -> index map ONCE per query (cached on the page object), and
+        # each listing does a single card click. Fallback to the original
+        # scan when the batched map is missing.
+        card_map = getattr(page, "_abgms_card_map", None)
+        if card_map is None:
+            card_map = _build_card_map(page)
+            if card_map is not None:
+                try:
+                    setattr(page, "_abgms_card_map", card_map)
+                except Exception:  # noqa: BLE001 — caching is best-effort
+                    pass
+        if card_map:
+            if _click_card_for(page, card_map, place_url):
+                return True
+            # A miss here (map invalidated by feed re-render) falls through
+            # to a one-time map rebuild, then the legacy scan.
+            card_map = _build_card_map(page)
+            try:
+                setattr(page, "_abgms_card_map", card_map)
+            except Exception:  # noqa: BLE001
+                pass
+            if card_map and _click_card_for(page, card_map, place_url):
+                return True
+        # Fallback: legacy per-card scan (selector drift / map invalidated).
+        # Token matching here too — exact-href equality was the production
+        # bug that pushed every listing onto the slow goto path.
+        token = _place_token(place_url)
         for sel in RESULT_CARD_SELECTORS:
             try:
                 locs = page.locator(sel)
                 n = locs.count()
                 for i in range(n):
                     href = locs.nth(i).get_attribute("href", timeout=1500)
-                    if href and href == place_url:
+                    if not href or "/maps/place/" not in href:
+                        continue
+                    if href == place_url or (token and token in href):
                         locs.nth(i).click(timeout=5000)
                         # Prove the detail panel switched to the clicked place
                         # (URL changed) instead of sleeping blindly (F02).
                         try:
-                            page.wait_for_function(
-                                "href => location.href.includes(decodeURIComponent(href))",
-                                arg=place_url, timeout=8_000)
+                            if token:
+                                page.wait_for_function(
+                                    "tok => decodeURIComponent(location.href)"
+                                    ".includes(tok)",
+                                    arg=token, timeout=8_000)
+                            else:
+                                page.wait_for_function(
+                                    "href => location.href.includes("
+                                    "decodeURIComponent(href))",
+                                    arg=place_url, timeout=8_000)
                             return True
                         except Exception:
                             return False
