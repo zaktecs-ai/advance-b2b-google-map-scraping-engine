@@ -18,6 +18,7 @@ import re
 
 from bs4 import BeautifulSoup
 
+from ..signals.social import _parse_html_or_xml
 from ..utils.normalize import is_usable_email, normalize_email
 
 _EMAIL_TOKEN_RE = re.compile(
@@ -75,7 +76,10 @@ def extract_emails(html: str | None, rendered_text: str = "", url: str = "",
                 candidates.append(ne)
 
     if html:
-        soup = BeautifulSoup(html, "lxml")
+        # Sitemap XML payloads reach this parser too — parse them with the
+        # XML parser so BeautifulSoup does not warn (and namespaced XML
+        # parses reliably); HTML pages keep the HTML parser.
+        soup = _parse_html_or_xml(html)
         for a in soup.find_all("a", href=True):
             href = a.get("href", "")
             if href.lower().startswith("mailto:"):

@@ -12,6 +12,26 @@ from __future__ import annotations
 import re
 from urllib.parse import urlsplit
 
+
+def _parse_html_or_xml(text: str):
+    """Parse a fetched document with the right BeautifulSoup parser.
+
+    Websites' ``sitemap.xml`` payloads reach the email/social extractors;
+    parsing XML with the HTML parser makes BeautifulSoup emit
+    ``XMLParsedAsHTMLWarning`` on every such page (and namespaced XML can
+    mis-parse). Detection: a document whose first tag is ``<?xml`` or
+    ``<urlset``/``<sitemapindex`` uses the XML parser; everything else keeps
+    the HTML parser. Both parsers ship with lxml (requirements.lock).
+    """
+    from bs4 import BeautifulSoup
+    head = (text or "").lstrip()[:200].lower()
+    if head.startswith("<?xml") or "<urlset" in head or "<sitemapindex" in head:
+        try:
+            return BeautifulSoup(text, "lxml-xml")
+        except Exception:  # noqa: BLE001 — fall back to the HTML parser
+            pass
+    return BeautifulSoup(text, "lxml")
+
 _PLATFORM_HOSTS = {
     "facebook": r"(^|\.)facebook\.com$",
     "instagram": r"(^|\.)instagram\.com$",
@@ -113,7 +133,9 @@ def social_urls_from_html(html: str, base_url: str = "") -> list[str]:
     if not html:
         return []
     from urllib.parse import urljoin
-    soup = BeautifulSoup(html, "lxml")
+    # Sitemap XML payloads reach this parser too — parse them with the XML
+    # parser so BeautifulSoup does not warn; HTML pages keep the HTML parser.
+    soup = _parse_html_or_xml(html)
     out: list[str] = []
     for a in soup.find_all("a", href=True):
         href = a.get("href", "").strip()
