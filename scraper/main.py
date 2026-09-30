@@ -44,6 +44,7 @@ def _build_collector(config, demo: bool, browser_manager, progress=None):
         max_scrolls=m.max_scrolls,
         scroll_pause_seconds=m.scroll_pause_seconds,
         extract_owner_posts=m.extract_owner_posts,
+        consent_retries=m.consent_retries,
     )
 
 

@@ -72,6 +72,13 @@ class MapsConfig(BaseModel):
     # costs ~3s per listing and these columns are unused in production.
     # Set true to restore the full old behavior.
     extract_owner_posts: bool = False
+    # BATTLE-HARDENING (consent incident 2026-09-29): when Google serves the
+    # consent wall on a detail panel, the engine dismisses it (Reject all)
+    # and retries the listing. This bounds the dismiss+retry rounds per
+    # listing before the worker recycles its browser. 2 is enough for the
+    # stickiest IPs (the sticky consent cookie usually makes round 1 the
+    # last one).
+    consent_retries: int = Field(default=2, ge=1, le=5)
 
 
 class ReviewsConfig(BaseModel):

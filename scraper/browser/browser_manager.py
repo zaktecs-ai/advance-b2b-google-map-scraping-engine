@@ -51,6 +51,72 @@ class BrowserManager:
         self._lock = threading.Lock()
         # The proxy most recently handed to a context, for failure feedback (A3).
         self._active_proxy: str | None = None
+        # Sticky consent cookies (battle-hardening, consent incident
+        # 2026-09-29): after ANY context successfully dismisses Google's
+        # consent wall, the consent cookies (e.g. SOCS) are captured here and
+        # injected into EVERY future context this manager creates (main
+        # browser, thread browsers, recycled browsers) — so one dismissal
+        # protects the whole rest of the run instead of every fresh context
+        # re-triggering the wall.
+        self._consent_cookies: list[dict] = []
+
+    # ------------------------------------------------------------------
+    # Sticky consent-cookie handling
+    # ------------------------------------------------------------------
+    def capture_consent_cookies(self, ctx) -> None:
+        """Store the consent cookies from a context that dismissed the wall.
+
+        Best-effort: keeps only cookies whose presence suppresses the
+        consent wall (SOCS / CONSENT / ACCOUNT_CHOOSER style names), so
+        unrelated session cookies are never carried across contexts.
+        """
+        if ctx is None:
+            return
+        wanted = ("socs", "consent", "account_chooser")
+        try:
+            cookies = ctx.cookies()
+        except Exception as e:  # noqa: BLE001 — best effort only
+            log.debug("consent cookie capture failed: %s", e)
+            return
+        keep = []
+        for c in cookies or []:
+            name = (c.get("name") or "").lower()
+            if any(w in name for w in wanted):
+                # Strip per-context fields the next context must regenerate.
+                clean = {k: c.get(k) for k in
+                         ("name", "value", "domain", "path", "expires",
+                          "httpOnly", "secure", "sameSite")
+                         if c.get(k) is not None}
+                keep.append(clean)
+        if keep:
+            with self._lock:
+                # Merge by cookie name (latest dismissal wins).
+                by_name = {c["name"]: c for c in self._consent_cookies}
+                for c in keep:
+                    by_name[c["name"]] = c
+                self._consent_cookies = list(by_name.values())
+            log.info("sticky consent cookies captured (%d): %s",
+                     len(self._consent_cookies),
+                     [c["name"] for c in self._consent_cookies])
+
+    def inject_consent_cookies(self, ctx) -> None:
+        """Add the captured consent cookies to a context (best-effort)."""
+        if ctx is None:
+            return
+        with self._lock:
+            cookies = list(self._consent_cookies)
+        if not cookies:
+            return
+        try:
+            ctx.add_cookies(cookies)
+            log.debug("injected %d consent cookie(s) into new context",
+                      len(cookies))
+        except Exception as e:  # noqa: BLE001 — old cookies may be expired
+            log.debug("consent cookie injection skipped: %s", e)
+            with self._lock:
+                # A rejected cookie set is stale — drop it so it doesn't
+                # poison every future context.
+                self._consent_cookies = []
 
     # ------------------------------------------------------------------
     def _ensure_browser(self):
@@ -129,7 +195,11 @@ class BrowserManager:
         if geolocation:
             kwargs["geolocation"] = geolocation
             kwargs["permissions"] = ["geolocation"]
-        return browser.new_context(**kwargs)
+        ctx = browser.new_context(**kwargs)
+        # Sticky consent cookies: every new context inherits the dismissal
+        # state captured from a previous context (consent incident fix).
+        self.inject_consent_cookies(ctx)
+        return ctx
 
     def report_proxy_failure(self) -> None:
         """Report the active proxy as failed so it drops out of rotation (A3)."""
@@ -272,7 +342,11 @@ class _ThreadBrowser:
         if geolocation:
             kwargs["geolocation"] = geolocation
             kwargs["permissions"] = ["geolocation"]
-        return self._browser.new_context(**kwargs)
+        ctx = self._browser.new_context(**kwargs)
+        # Sticky consent cookies: parallel worker contexts inherit the
+        # dismissal state too (consent incident fix).
+        self._bm.inject_consent_cookies(ctx)
+        return ctx
 
     @property
     def nav_timeout_ms(self) -> int:

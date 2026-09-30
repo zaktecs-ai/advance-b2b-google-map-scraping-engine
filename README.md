@@ -257,6 +257,14 @@ deep-dive lives in `docs/ARCHITECTURE.md` and `CHANGES.md`.
 - **"It stopped / Google blocked me."** — Stop, wait a few hours, raise
   `delays.maps_min/max_seconds` to 2.0/5.0, set `maps.workers: 1`, restart.
   The checkpoint means nothing is lost.
+- **"Google shows the cookie / consent wall ("Before you continue to
+  Google")."** — The engine handles this itself: it clicks "Reject all",
+  saves the consent cookie for every future browser, and retries the
+  listing (up to `maps.consent_retries`, default 2). If the wall keeps
+  coming back, the engine recycles the browser and continues; junk rows are
+  never saved (the quality gate rejects any wall-contaminated record). You
+  do not need to solve it manually — but if you want to watch, use the VNC
+  screen (`vnc-screen.sh`).
 - **"I only want businesses with websites."** — `website.require_website: true`
   or a `filters.include_all` rule.
 - **"Where are my leads?"** — `output/<client_name>/leads.csv` (+ `.xlsx`).

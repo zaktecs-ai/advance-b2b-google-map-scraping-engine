@@ -37,6 +37,15 @@ maps:
                                # bot challenge everything falls back to 1.
   extract_owner_posts: false   # true = restore the ~3s/listing deep scroll
                                # for has_recent_post / latest_post_date.
+  # --- BATTLE-HARDENING (consent incident 2026-09-29) ----------------------
+  consent_retries: 2           # When Google shows the "Before you continue"
+                               # cookie wall on a listing, the engine clicks
+                               # "Reject all", saves the consent cookie for
+                               # every future browser, and retries the
+                               # listing. This is the retry budget per
+                               # listing (1-5) before recycling the browser.
+                               # Junk rows are NEVER saved: the quality gate
+                               # also rejects any wall-contaminated record.
 
 reviews:
   enabled: true

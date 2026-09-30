@@ -823,3 +823,55 @@ Deep-probe (7–8 listings, zero pacing): 2.11s → **1.30s/listing**. Observed
 Google-side variance documented in docs/PERFORMANCE.md (first panel ~5s
 SPA warm-up; rotating "limited view" panels omit the review-count row —
 engine honestly reports N/A instead of guessing). tests: 290/290.
+
+---
+
+## HARDEN-01 — Consent-wall battle-hardening (production incident 2026-09-29)
+
+**Incident (owner's production run, Oracle VPS, visible VNC browser):** after
+~2h40m of clean scraping (1,600+ leads), Google began serving the GDPR
+consent wall ("Before you continue to Google" / "Accept all" / "Reject all")
+on the DETAIL-PANEL navigations. Three engine weaknesses turned that into a
+data-quality failure:
+
+- The parallel workers had NO consent handling at all (only the serial
+  search-page goto did).
+- The wall's own h1 ("Before you continue to Google") satisfied the panel
+  readiness wait, so the wall title was EXTRACTED AS business_name and
+  SAVED — 53 junk rows committed in the last query alone ("saved 1643 /
+  collected 1651" terminal tail).
+- A dismissal in one context helped nothing: fresh contexts (new thread
+  browsers, recycles) re-triggered the wall, and the coherence-retry goto
+  re-read the wall title as the "repaired" name.
+
+**Fixes (all unit-tested; 18 new tests in tests/test_consent_wall.py):**
+
+- **Detection everywhere:**
+  - `is_consent_wall_url()` / `is_consent_wall_text()` pure helpers.
+  - `_open_and_extract` raises `ConsentWallError` when the panel URL is the
+    consent host OR the panel h1 is a wall title — before ANY field read.
+  - The coherence-retry (goto) path dismisses the wall and re-checks the
+    retry name for wall text before accepting it (the exact incident path).
+- **Recovery, never junk:** `_extract_with_consent_recovery` wraps every
+  listing extraction on BOTH the serial loop and the parallel workers:
+  dismiss (Reject-all preferred — politest choice) -> capture the consent
+  cookies -> retry the listing (bounded by `maps.consent_retries`, default
+  2). A persistent wall returns None -> the worker RECYCLES its browser
+  (fresh context) and moves on — the wall record is never yielded.
+- **Sticky consent cookies (the big win):** `BrowserManager` now keeps a
+  consent-cookie store (SOCS/CONSENT-style only — session cookies never
+  carried over). Every context it creates — main browser, thread browsers,
+  recycled browsers — inherits the captured cookies, so ONE dismissal
+  protects the rest of the run across queries and recycles. A rejected
+  (stale) injection clears the store.
+- **Quality gate (last line of defense):** `quality_issues` now flags
+  `consent_wall_contamination` (wall title as name) and `consent_wall_url`
+  (consent host as the Maps URL) — a contaminated record FAILS the gate and
+  is never committed, no matter what any upstream layer misses.
+- **Hardened dismissal:** Reject-all button selectors first (live-verified
+  present on the current wall), plus aria-label and form-submit fallbacks;
+  post-dismissal verification (URL off the consent host, buttons gone).
+
+**Behavior preserved:** output schema, dedup, checkpoint semantics, pacing,
+CAPTCHA detection/cooldown, parallel architecture — unchanged. tests:
+308/308 (290 existing + 18 new).

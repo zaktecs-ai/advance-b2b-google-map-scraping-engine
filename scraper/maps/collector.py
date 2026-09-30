@@ -59,13 +59,78 @@ _CONSENT_MARKERS = [
     "zustimmen", "i agree", "reject all",
 ]
 _CONSENT_BUTTON_SELECTORS = [
+    # Reject-style FIRST (live-verified 2026-09 incident: the wall renders
+    # "Reject all" / "Accept all" / "More options"; Reject-all clears the
+    # wall while declining ad personalization — the politest choice — and is
+    # the button the incident screenshots confirmed present).
+    'button:has-text("Reject all")',
+    'button[aria-label*="Reject all"]',
+    'button:has-text("Alle ablehnen")',
+    # Accept-style fallbacks (older wall variants / locales)
     'button:has-text("Accept all")',
     'button:has-text("Alle akzeptieren")',
     'button:has-text("Zustimmen")',
     'button:has-text("I agree")',
     'div[role="dialog"] button:has-text("Accept")',
     'button[aria-label*="Accept all"]',
+    'form[action*="consent"] button',
 ]
+# The consent wall's own title text — when the detail panel shows THIS as its
+# h1, the panel is NOT a business listing (live incident 2026-09-29: the
+# wall's title was extracted as business_name and 53 junk rows were saved).
+_CONSENT_WALL_TITLES = (
+    "before you continue to google",
+    "before you continue",
+    "consent required",
+)
+
+
+class ConsentWallError(RuntimeError):
+    """Raised when the open detail panel is actually the Google consent wall.
+
+    The caller (worker/serial loop) reacts by dismissing the wall on THAT
+    page and retrying the listing — the record is NEVER yielded as data.
+    """
+
+    def __init__(self, url: str = ""):
+        self.url = url
+        super().__init__(
+            f"consent wall detected on panel (url={url[:100]}) — "
+            f"record skipped, wall will be dismissed and the listing retried"
+        )
+
+
+def is_consent_wall_url(url: str) -> bool:
+    """True when the page URL is a consent/interstitial redirect."""
+    u = (url or "").lower()
+    return (u.startswith("https://consent.google.")
+            or "//consent.google." in u)
+
+
+def is_consent_wall_text(text: str) -> bool:
+    """True when a panel's heading/text is the consent wall, not a business.
+
+    Pure helper (unit-tested): matches the wall's distinctive titles and
+    marker phrases, case-insensitively.
+    """
+    if not text:
+        return False
+    low = text.strip().lower()
+    if low in _CONSENT_WALL_TITLES:
+        return True
+    return any(m in low for m in _CONSENT_MARKERS[:4])
+
+
+def ctx_of_page(page):
+    """Best-effort: the page's owning BrowserContext (for cookie capture).
+
+    Playwright sync objects expose the owning context via ``page.context``;
+    any failure returns None (cookie capture is best-effort by design).
+    """
+    try:
+        return getattr(page, "context", None)
+    except Exception:  # noqa: BLE001
+        return None
 
 _BOT_MARKERS = [
     "unusual traffic", "unusual traffic from your computer network",
@@ -74,7 +139,23 @@ _BOT_MARKERS = [
 
 
 def handle_consent_wall(page) -> bool:
-    """Dismiss the EU GDPR consent screen if present. Returns True if it acted."""
+    """Dismiss the EU GDPR consent screen if present. Returns True if it acted.
+
+    Battle-hardened (2026-30 incident): the wall now appears on DETAIL-PANEL
+    navigations too (not just the search page), so this runs after every
+    panel open AND every goto fallback. Dismissal order prefers "Reject all"
+    (minimal tracking) — both buttons clear the wall; each attempt verifies
+    the wall actually left (URL off consent.google AND no button remains)
+    before returning True.
+    """
+    dismissed = _dismiss_consent_once(page)
+    if dismissed:
+        _verify_wall_left(page)
+    return dismissed
+
+
+def _dismiss_consent_once(page) -> bool:
+    """One dismissal attempt: click any consent button on the wall."""
     try:
         content = page.content()
     except Exception:
@@ -82,15 +163,41 @@ def handle_consent_wall(page) -> bool:
     low = content.lower()
     if not any(m in low for m in _CONSENT_MARKERS):
         return False
+    if not is_consent_wall_url(page.url or ""):
+        # Not on the consent host but markers present (wall rendered inline):
+        # still dismissable — the buttons live in the DOM either way.
+        pass
     for sel in _CONSENT_BUTTON_SELECTORS:
         try:
             btn = page.locator(sel).first
             if btn.count() > 0 and btn.is_visible():
                 btn.click(timeout=3000)
+                log.info("consent wall dismissed via %r", sel)
                 return True
         except Exception:
             continue
     return False
+
+
+def _verify_wall_left(page) -> bool:
+    """Post-dismissal verification: wall buttons gone + URL off consent host."""
+    try:
+        if is_consent_wall_url(page.url or ""):
+            # The wall redirects after dismissal; give it a bounded moment.
+            try:
+                page.wait_for_url("**/maps/**", timeout=5_000)
+            except Exception:  # noqa: BLE001 — redirect may be slower
+                pass
+        for sel in _CONSENT_BUTTON_SELECTORS[:3]:
+            try:
+                btn = page.locator(sel).first
+                if btn.count() > 0 and btn.is_visible():
+                    return False
+            except Exception:
+                continue
+        return True
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def detect_bot_challenge(html_or_text: str) -> bool:
@@ -883,7 +990,8 @@ class MapsCollector:
                  reviews_per_business: int = 5, collect_reviews: bool = True,
                  on_query_total=None,
                  max_scrolls: int = 0, scroll_pause_seconds: float = 0.0,
-                 extract_owner_posts: bool = False):
+                 extract_owner_posts: bool = False,
+                 consent_retries: int = 2):
         self._bm = browser_manager
         self._max_per_query = max_results_per_query
         self._max_total = max_total_results
@@ -906,6 +1014,9 @@ class MapsCollector:
         # latest_post_date). Default false — owner decision: the deep scroll
         # costs ~3s per listing and the columns are unused in production.
         self._extract_owner_posts = extract_owner_posts
+        # maps.consent_retries: dismiss+retry rounds when Google serves the
+        # consent wall on a panel (incident 2026-09-29 hardening).
+        self._consent_retries = consent_retries
         self._yielded_total = 0
         self.limit_reached = False
 
@@ -990,8 +1101,32 @@ class MapsCollector:
                             self._yielded_total >= self._max_total):
                         self.limit_reached = True
                         break
-                    data = self._open_and_extract(
-                        page, place_url, position=pos, total=total)
+                    data = self._extract_with_consent_recovery(
+                        page, place_url, pos, total)
+                    if data is None:
+                        # Unrecoverable consent wall on this page — recycle
+                        # the worker's browser so the next listing starts
+                        # from a fresh context (a fresh context re-triggers
+                        # the wall only when Google demands it again; the
+                        # sticky-cookie store usually prevents even that).
+                        log.warning("consent wall persisted for %s — "
+                                    "recycling worker browser", place_url)
+                        try:
+                            if page is not None:
+                                page.close()
+                            if ctx is not None:
+                                ctx.close()
+                        except Exception:  # noqa: BLE001
+                            pass
+                        try:
+                            ctx = tb.new_context()
+                            page = ctx.new_page()
+                            page.set_default_timeout(tb.nav_timeout_ms)
+                        except Exception as e:  # noqa: BLE001
+                            with err_lock:
+                                errors.append(e)
+                            break
+                        continue
                     if not data.get("business_name"):
                         data["business_name"] = fallback_business_name(place_url)
                     data["source_query"] = query
@@ -1086,6 +1221,12 @@ class MapsCollector:
                     time.sleep(2.0)
                 if handle_consent_wall(page):
                     time.sleep(3.0)
+                    # Sticky cookie: capture the dismissal so every future
+                    # context inherits it (consent incident hardening).
+                    try:
+                        self._bm.capture_consent_cookies(ctx_of_page(page))
+                    except Exception:  # noqa: BLE001
+                        pass
                 if detect_bot_challenge(page.content()):
                     log.warning("bot challenge for query %r — cooling down",
                                 query)
@@ -1122,6 +1263,47 @@ class MapsCollector:
             except Exception as e:
                 log.debug("ctx close: %s", e)
 
+    def _extract_with_consent_recovery(self, page, place_url: str,
+                                        pos: int, total: int) -> dict | None:
+        """Extract one listing with consent-wall recovery.
+
+        Battle-hardening (incident 2026-09-29): when Google serves the
+        consent wall on the panel, _open_and_extract raises
+        ConsentWallError. Recovery on THIS page: dismiss the wall
+        (Reject-all preference), capture the sticky consent cookie for
+        every future context, then retry the extraction (panel re-opens
+        from the same card flow). Up to ``consent_retries`` dismissal
+        rounds; returns None when the wall persists (caller recycles the
+        browser). The consent-wall record is NEVER returned as data.
+        """
+        retries = max(1, int(getattr(self, "_consent_retries", 1) or 1))
+        for attempt in range(1, retries + 1):
+            try:
+                return self._open_and_extract(
+                    page, place_url, position=pos, total=total)
+            except ConsentWallError:
+                log.warning("consent wall on %s — dismissing "
+                            "(attempt %d/%d)", place_url, attempt, retries)
+                try:
+                    dismissed = handle_consent_wall(page)
+                except Exception:  # noqa: BLE001
+                    dismissed = False
+                if not dismissed:
+                    return None
+                # Persist the dismissal cookie so every FUTURE context
+                # (worker recycle, browser recycle, next queries) inherits
+                # it — the single biggest hardening win.
+                try:
+                    self._bm.capture_consent_cookies(ctx_of_page(page))
+                except Exception:  # noqa: BLE001 — best effort
+                    pass
+                try:
+                    page.wait_for_selector('div[role="feed"], h1',
+                                           timeout=10_000)
+                except Exception:  # noqa: BLE001
+                    pass
+        return None
+
     def _collect_on_page(self, query: str, page) -> Iterator[dict]:
         url = _with_region(MAPS_SEARCH_URL.format(query=quote_plus(query)),
                            self._hl, self._gl)
@@ -1136,6 +1318,12 @@ class MapsCollector:
 
         if handle_consent_wall(page):
             time.sleep(3.0)
+            # Sticky cookie: capture the dismissal so every future
+            # context inherits it (consent incident hardening).
+            try:
+                self._bm.capture_consent_cookies(ctx_of_page(page))
+            except Exception:  # noqa: BLE001
+                pass
 
         if detect_bot_challenge(page.content()):
             log.warning("bot challenge for query %r — cooling down %.0fs",
@@ -1178,8 +1366,13 @@ class MapsCollector:
                 break
             if self._max_per_query and yielded >= self._max_per_query:
                 break
-            data = self._open_and_extract(page, place_url, position=pos,
-                                          total=len(listing_links))
+            # Battle-hardening: consent-wall recovery on the serial path too
+            # (None -> skip this listing; the wall was dismissed + cookie
+            # captured on the page for every future context).
+            data = self._extract_with_consent_recovery(
+                page, place_url, pos, len(listing_links))
+            if data is None:
+                continue
             if not data.get("business_name"):
                 data["business_name"] = fallback_business_name(place_url)
             data["source_query"] = query
@@ -1262,6 +1455,24 @@ class MapsCollector:
                 time.sleep(0.5)
             except Exception:  # noqa: BLE001
                 pass
+
+        # BATTLE-HARDENING (consent incident 2026-09-29): the readiness wait
+        # proves an h1 exists — but when Google serves the consent wall on
+        # the panel, the wall's OWN h1 ("Before you continue to Google")
+        # satisfies it, and the wall's title was then extracted as
+        # business_name and SAVED (53 junk rows in one query). Guard: if the
+        # panel's URL is the consent host OR its h1 is a wall title, raise so
+        # the worker dismisses the wall and retries — NEVER extract the wall.
+        try:
+            if is_consent_wall_url(page.url or ""):
+                raise ConsentWallError(place_url)
+        except ConsentWallError:
+            raise
+        except Exception:  # noqa: BLE001 — URL read failure falls through
+            pass
+        wall_name = (_first_text(page, NAME_SELECTORS) or "")
+        if is_consent_wall_text(wall_name):
+            raise ConsentWallError(place_url)
 
         # PERF (Fix F): ONE batched evaluate() for every stable panel field
         # (name/category/address/phone/website/plus_code/hours/status/claim/
@@ -1377,12 +1588,24 @@ class MapsCollector:
                 page.goto(_with_region(place_url, self._hl, self._gl),
                           wait_until="domcontentloaded",
                           timeout=self._bm.nav_timeout_ms)
+                # Battle-hardening: a goto landing on the consent wall must
+                # never have its title read as the business name (incident:
+                # the wall title passed through here as a "repaired" name).
+                if handle_consent_wall(page):
+                    log.info("consent wall dismissed after coherence-retry "
+                             "goto for %s", place_url)
                 try:
                     page.wait_for_selector('h1, div[role="feed"], div[role="main"]',
                                            timeout=15_000)
                 except Exception:
                     time.sleep(1.5)
-                data["business_name"] = _first_text(page, NAME_SELECTORS)
+                retry_name = _first_text(page, NAME_SELECTORS) or ""
+                if is_consent_wall_text(retry_name):
+                    raise ConsentWallError(place_url)
+                if retry_name:
+                    data["business_name"] = retry_name
+            except ConsentWallError:
+                raise
             except Exception as e:
                 log.debug("coherence retry failed for %s: %s", place_url, e)
         return data
